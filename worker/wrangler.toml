@@ -7,12 +7,12 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "excel-suite-db"
-database_id = "YOUR_DATABASE_ID_HERE"
+database_id = "0881424a-39a6-470b-93f3-7ec314aa97b2"
 
 # R2 Bucket binding
-[[r2_buckets]]
-binding = "R2"
-bucket_name = "excel-suite-files"
+# [[r2_buckets]]
+# binding = "R2"
+# bucket_name = "excel-suite-files"
 
 # Environment variables
 [vars]
