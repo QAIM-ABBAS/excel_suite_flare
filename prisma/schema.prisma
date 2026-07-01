@@ -1,0 +1,28 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model FileRecord {
+  id           String   @id @default(cuid())
+  filename     String
+  originalName String
+  mimeType     String
+  size         Int
+  tool         String   // which tool was used: merge, convert, duplicates, attendance, download-excel, download-images
+  status       String   @default("completed") // pending, processing, completed, failed
+  outputPath   String?
+  createdAt    DateTime @default(now())
+}
+
+model ErrorLog {
+  id        String   @id @default(cuid())
+  tool      String
+  message   String
+  details   String?
+  createdAt DateTime @default(now())
+}

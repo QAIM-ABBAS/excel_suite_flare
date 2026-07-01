@@ -1,0 +1,972 @@
+     1→#!/usr/bin/env python3
+     2→"""
+     3→Excel Suite - Python CLI Tool
+     4→Invoked as a subprocess by Next.js API routes.
+     5→Each call processes a single request and outputs JSON to stdout.
+     6→
+     7→Usage: python3 cli.py <tool> <json_args_file>
+     8→"""
+     9→
+    10→import sys
+    11→import json
+    12→import os
+    13→import re
+    14→import uuid
+    15→import statistics
+    16→from pathlib import Path
+    17→from collections import Counter
+    18→
+    19→import pandas as pd
+    20→
+    21→# Config
+    22→BASE_DIR = Path(__file__).resolve().parent.parent.parent
+    23→DOWNLOAD_DIR = BASE_DIR / "download"
+    24→DB_PATH = BASE_DIR / "db" / "custom.db"
+    25→
+    26→
+    27→def ensure_download_dir():
+    28→    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    29→
+    30→
+    31→def sanitize_filename(name: str) -> str:
+    32→    return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
+    33→
+    34→
+    35→def get_db():
+    36→    import sqlite3
+    37→    conn = sqlite3.connect(str(DB_PATH))
+    38→    conn.row_factory = sqlite3.Row
+    39→    return conn
+    40→
+    41→
+    42→def record_file(filename, original_name, mime, size, tool, output_path):
+    43→    try:
+    44→        conn = get_db()
+    45→        conn.execute(
+    46→            """INSERT INTO FileRecord (id, filename, originalName, mimeType, size, tool, status, outputPath, createdAt, updatedAt)
+    47→               VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, datetime('now'), datetime('now'))""",
+    48→            (str(uuid.uuid4()), filename, original_name, mime, size, tool, output_path),
+    49→        )
+    50→        conn.commit()
+    51→        conn.close()
+    52→    except Exception as e:
+    53→        print(f"DB record error: {e}", file=sys.stderr)
+    54→
+    55→
+    56→def log_error(tool, message, details=""):
+    57→    try:
+    58→        conn = get_db()
+    59→        conn.execute(
+    60→            """INSERT INTO ErrorLog (id, tool, message, details, createdAt, updatedAt)
+    61→               VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))""",
+    62→            (str(uuid.uuid4()), tool, message, details),
+    63→        )
+    64→        conn.commit()
+    65→        conn.close()
+    66→    except Exception as e:
+    67→        print(f"DB error log error: {e}", file=sys.stderr)
+    68→
+    69→
+    70→def df_to_dicts(df: pd.DataFrame) -> list[dict]:
+    71→    result = []
+    72→    for _, row in df.iterrows():
+    73→        d = {}
+    74→        for col in df.columns:
+    75→            val = row[col]
+    76→            if pd.isna(val):
+    77→                d[col] = ""
+    78→            elif isinstance(val, (int, float)):
+    79→                d[col] = val
+    80→            else:
+    81→                d[col] = str(val)
+    82→        result.append(d)
+    83→    return result
+    84→
+    85→
+    86→def save_df_to_file(df, base_name, suffix, output_format="xlsx", delimiter=","):
+    87→    ensure_download_dir()
+    88→    uid = uuid.uuid4().hex[:8]
+    89→    safe_base = sanitize_filename(base_name)
+    90→
+    91→    if output_format == "csv":
+    92→        filename = f"{safe_base}_{suffix}_{uid}.csv"
+    93→        filepath = DOWNLOAD_DIR / filename
+    94→        df.to_csv(filepath, index=False, sep=delimiter)
+    95→        mime = "text/csv"
+    96→    else:
+    97→        filename = f"{safe_base}_{suffix}_{uid}.xlsx"
+    98→        filepath = DOWNLOAD_DIR / filename
+    99→        df.to_excel(filepath, index=False, engine="openpyxl")
+   100→        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+   101→
+   102→    return {"filename": filename, "filepath": str(filepath), "size": filepath.stat().st_size, "mime": mime}
+   103→
+   104→
+   105→def read_file_to_df(filepath, delimiter=","):
+   106→    ext = Path(filepath).suffix.lower()
+   107→    if ext == ".csv":
+   108→        df = pd.read_csv(filepath, delimiter=delimiter, dtype=str, keep_default_na=False)
+   109→    else:
+   110→        df = pd.read_excel(filepath, engine="openpyxl", dtype=str, keep_default_na=False)
+   111→    df = df.fillna("")
+   112→    return df
+   113→
+   114→
+   115→# ─── Tool implementations ──────────────────────────────────────────────────────
+   116→
+   117→def tool_merge(args):
+   118→    files = args.get("files", [])
+   119→    output_format = args.get("outputFormat", "xlsx")
+   120→    output_filename = args.get("outputFilename", "merged")
+   121→
+   122→    if len(files) < 2:
+   123→        return {"error": "At least 2 files are required"}
+   124→
+   125→    all_dfs = []
+   126→    all_headers = []
+   127→    for f in files:
+   128→        df = read_file_to_df(f)
+   129→        if not df.empty:
+   130→            all_headers.append(list(df.columns))
+   131→            all_dfs.append(df)
+   132→
+   133→    merged = pd.concat(all_dfs, ignore_index=True)
+   134→    base_headers = all_headers[0] if all_headers else []
+   135→    has_mismatch = any(len(h) != len(base_headers) or h != base_headers for h in all_headers)
+   136→
+   137→    safe_name = sanitize_filename(output_filename) or "merged"
+   138→    info = save_df_to_file(merged, safe_name, "", output_format)
+   139→    record_file(info["filename"], f"{safe_name}.xlsx", info["mime"], info["size"], "merge", info["filepath"])
+   140→
+   141→    return {
+   142→        "success": True,
+   143→        "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   144→        "filename": info["filename"],
+   145→        "totalRows": len(merged),
+   146→        "headers": base_headers,
+   147→        "hasMismatch": has_mismatch,
+   148→        "mismatchWarning": "Some files have different headers. Data was merged using all available columns." if has_mismatch else None,
+   149→    }
+   150→
+   151→
+   152→def tool_columns(args):
+   153→    filepath = args.get("filepath", "")
+   154→    if not filepath:
+   155→        return {"error": "File path is required"}
+   156→
+   157→    ext = Path(filepath).suffix.lower()
+   158→    if ext == ".csv":
+   159→        df = pd.read_csv(filepath, dtype=str, keep_default_na=False).fillna("")
+   160→        sheets = [{"name": "Sheet1", "columns": list(df.columns), "rowCount": len(df)}]
+   161→        preview = df_to_dicts(df.head(5))
+   162→    else:
+   163→        xls = pd.ExcelFile(filepath, engine="openpyxl")
+   164→        sheets = []
+   165→        preview = []
+   166→        for name in xls.sheet_names:
+   167→            sheet_df = pd.read_excel(xls, sheet_name=name, dtype=str, keep_default_na=False).fillna("")
+   168→            sheets.append({"name": name, "columns": list(sheet_df.columns), "rowCount": len(sheet_df)})
+   169→        if sheets:
+   170→            first_df = pd.read_excel(xls, sheet_name=sheets[0]["name"], dtype=str, keep_default_na=False).fillna("")
+   171→            preview = df_to_dicts(first_df.head(5))
+   172→
+   173→    return {"success": True, "sheets": sheets, "preview": preview}
+   174→
+   175→
+   176→def tool_duplicates(args):
+   177→    filepath = args.get("filepath", "")
+   178→    column = args.get("column", "")
+   179→    keep = args.get("keepOccurrence", "first")
+   180→
+   181→    if not filepath or not column:
+   182→        return {"error": "File and column are required"}
+   183→
+   184→    df = read_file_to_df(filepath)
+   185→    if df.empty:
+   186→        return {"error": "File is empty"}
+   187→
+   188→    original_len = len(df)
+   189→    keep_val = "first" if keep == "first" else "last"
+   190→    duplicates_mask = df.duplicated(subset=[column], keep=keep_val)
+   191→    deleted_count = int(duplicates_mask.sum())
+   192→    cleaned = df.drop_duplicates(subset=[column], keep=keep_val).reset_index(drop=True)
+   193→
+   194→    base_name = Path(filepath).stem
+   195→    info = save_df_to_file(cleaned, base_name, "cleaned")
+   196→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "duplicates", info["filepath"])
+   197→
+   198→    deleted_preview = df_to_dicts(df[duplicates_mask].head(10))
+   199→    remaining_preview = df_to_dicts(cleaned.head(5))
+   200→
+   201→    return {
+   202→        "success": True,
+   203→        "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   204→        "filename": info["filename"],
+   205→        "totalRows": original_len,
+   206→        "duplicateRows": deleted_count,
+   207→        "remainingRows": len(cleaned),
+   208→        "preview": {"deleted": deleted_preview, "remaining": remaining_preview},
+   209→    }
+   210→
+   211→
+   212→def tool_convert(args):
+   213→    filepath = args.get("filepath", "")
+   214→    target_format = args.get("targetFormat", "xlsx")
+   215→    delimiter = args.get("delimiter", ",")
+   216→
+   217→    if not filepath:
+   218→        return {"error": "File is required"}
+   219→
+   220→    ext = Path(filepath).suffix.lower()
+   221→    if ext == ".csv":
+   222→        df = pd.read_csv(filepath, delimiter=delimiter, dtype=str, keep_default_na=False).fillna("")
+   223→        sheets = ["Sheet1"]
+   224→    else:
+   225→        xls = pd.ExcelFile(filepath, engine="openpyxl")
+   226→        sheets = xls.sheet_names
+   227→        target_sheet = args.get("sheetName") or sheets[0]
+   228→        if target_sheet not in sheets:
+   229→            return {"error": f"Sheet '{target_sheet}' not found. Available: {', '.join(sheets)}"}
+   230→        df = pd.read_excel(xls, sheet_name=target_sheet, dtype=str, keep_default_na=False).fillna("")
+   231→
+   232→    base_name = Path(filepath).stem
+   233→    info = save_df_to_file(df, base_name, "", target_format, delimiter)
+   234→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "convert", info["filepath"])
+   235→
+   236→    return {
+   237→        "success": True,
+   238→        "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   239→        "filename": info["filename"],
+   240→        "sheets": sheets,
+   241→    }
+   242→
+   243→
+   244→def tool_stats(args):
+   245→    filepath = args.get("filepath", "")
+   246→    generate_report = args.get("generateReport", "false")
+   247→
+   248→    if not filepath:
+   249→        return {"error": "File is required"}
+   250→
+   251→    df = read_file_to_df(filepath)
+   252→    if df.empty:
+   253→        return {"error": "File is empty"}
+   254→
+   255→    stats = []
+   256→    for col in df.columns:
+   257→        values = df[col].tolist()
+   258→        non_empty = [v for v in values if v != "" and v is not None]
+   259→        numeric_vals = []
+   260→        for v in non_empty:
+   261→            try:
+   262→                numeric_vals.append(float(v))
+   263→            except (ValueError, TypeError):
+   264→                pass
+   265→
+   266→        distinct = len(set(str(v) for v in non_empty))
+   267→        missing = len(values) - len(non_empty)
+   268→
+   269→        if len(non_empty) == 0:
+   270→            col_type = "empty"
+   271→        elif len(numeric_vals) == len(non_empty):
+   272→            col_type = "numeric"
+   273→        elif len(numeric_vals) == 0:
+   274→            col_type = "text"
+   275→        else:
+   276→            col_type = "mixed"
+   277→
+   278→        stat = {"column": col, "type": col_type, "count": len(non_empty), "distinct": distinct, "missing": missing}
+   279→
+   280→        if col_type in ("numeric", "mixed") and numeric_vals:
+   281→            stat["sum"] = round(sum(numeric_vals), 4)
+   282→            stat["avg"] = round(statistics.mean(numeric_vals), 4)
+   283→            stat["min"] = min(numeric_vals)
+   284→            stat["max"] = max(numeric_vals)
+   285→            sorted_nums = sorted(numeric_vals)
+   286→            n = len(sorted_nums)
+   287→            if n % 2 == 0:
+   288→                stat["median"] = round((sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2, 4)
+   289→            else:
+   290→                stat["median"] = round(sorted_nums[n // 2], 4)
+   291→            if len(numeric_vals) > 1:
+   292→                stat["stdDev"] = round(statistics.stdev(numeric_vals), 4)
+   293→            else:
+   294→                stat["stdDev"] = 0.0
+   295→
+   296→        if col_type in ("text", "mixed") and non_empty:
+   297→            lengths = [len(str(v)) for v in non_empty]
+   298→            stat["minLength"] = min(lengths)
+   299→            stat["maxLength"] = max(lengths)
+   300→
+   301→        freq = Counter(str(v) for v in non_empty)
+   302→        stat["topValues"] = [{"value": v, "count": c} for v, c in freq.most_common(5)]
+   303→        stats.append(stat)
+   304→
+   305→    download_url = None
+   306→    report_filename = None
+   307→    if generate_report == "true":
+   308→        base_name = Path(filepath).stem
+   309→        info = save_df_to_file(pd.DataFrame(), base_name, "stats")
+   310→        summary_data = []
+   311→        for s in stats:
+   312→            row = {
+   313→                "Column": s["column"], "Type": s["type"], "Count": s["count"],
+   314→                "Distinct": s["distinct"], "Missing": s["missing"],
+   315→                "Sum": s.get("sum", ""), "Average": s.get("avg", ""),
+   316→                "Min": s.get("min", ""), "Max": s.get("max", ""),
+   317→                "Median": s.get("median", ""), "Std Dev": s.get("stdDev", ""),
+   318→                "Min Length": s.get("minLength", ""), "Max Length": s.get("maxLength", ""),
+   319→            }
+   320→            summary_data.append(row)
+   321→
+   322→        with pd.ExcelWriter(info["filepath"], engine="openpyxl") as writer:
+   323→            pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
+   324→            top_rows = []
+   325→            for s in stats:
+   326→                for tv in s.get("topValues", []):
+   327→                    top_rows.append({
+   328→                        "Column": s["column"], "Value": tv["value"],
+   329→                        "Count": tv["count"],
+   330→                        "Percent of Filled": f"{(tv['count'] / max(s['count'], 1) * 100):.1f}%",
+   331→                    })
+   332→            if top_rows:
+   333→                pd.DataFrame(top_rows).to_excel(writer, sheet_name="Top Values", index=False)
+   334→
+   335→        info["size"] = Path(info["filepath"]).stat().st_size
+   336→        record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "stats", info["filepath"])
+   337→        download_url = f"/api/tools/download?file={info['filename']}"
+   338→        report_filename = info["filename"]
+   339→
+   340→    return {
+   341→        "success": True, "totalRows": len(df), "totalColumns": len(df.columns),
+   342→        "stats": stats, "downloadUrl": download_url, "filename": report_filename,
+   343→    }
+   344→
+   345→
+   346→def tool_sort(args):
+   347→    filepath = args.get("filepath", "")
+   348→    column = args.get("column", "")
+   349→    order = args.get("order", "asc")
+   350→
+   351→    if not filepath or not column:
+   352→        return {"error": "File and column are required"}
+   353→
+   354→    df = read_file_to_df(filepath)
+   355→    if df.empty:
+   356→        return {"error": "File is empty"}
+   357→    if column not in df.columns:
+   358→        return {"error": f"Column '{column}' not found"}
+   359→
+   360→    ascending = order == "asc"
+   361→    try:
+   362→        df["_num"] = pd.to_numeric(df[column], errors="coerce")
+   363→        has_nums = df["_num"].notna().any()
+   364→    except Exception:
+   365→        has_nums = False
+   366→
+   367→    if has_nums:
+   368→        df_sorted = df.sort_values(by="_num", ascending=ascending, na_position="last").drop(columns=["_num"])
+   369→    else:
+   370→        df_sorted = df.sort_values(by=column, ascending=ascending, na_position="last")
+   371→
+   372→    df_sorted = df_sorted.reset_index(drop=True)
+   373→    base_name = Path(filepath).stem
+   374→    info = save_df_to_file(df_sorted, base_name, "sorted")
+   375→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "sort", info["filepath"])
+   376→
+   377→    return {
+   378→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   379→        "filename": info["filename"], "totalRows": len(df_sorted),
+   380→        "sortedBy": column, "order": order, "preview": df_to_dicts(df_sorted.head(10)),
+   381→    }
+   382→
+   383→
+   384→def tool_filter(args):
+   385→    filepath = args.get("filepath", "")
+   386→    conditions = args.get("conditions", [])
+   387→    combine_with = args.get("combineWith", "AND")
+   388→
+   389→    if not filepath:
+   390→        return {"error": "File is required"}
+   391→    if not conditions:
+   392→        return {"error": "At least one filter condition is required"}
+   393→
+   394→    df = read_file_to_df(filepath)
+   395→    if df.empty:
+   396→        return {"error": "File is empty"}
+   397→
+   398→    for c in conditions:
+   399→        if c.get("column") not in df.columns:
+   400→            return {"error": f"Column '{c.get('column')}' not found"}
+   401→
+   402→    def apply_condition(row, cond):
+   403→        col = cond["column"]
+   404→        op = cond["operator"]
+   405→        val = cond.get("value", "")
+   406→        cell = str(row.get(col, ""))
+   407→
+   408→        if op == "equals":
+   409→            try:
+   410→                return float(cell) == float(val) if val != "" else cell == val
+   411→            except ValueError:
+   412→                return cell == val
+   413→        elif op == "not_equals":
+   414→            try:
+   415→                return float(cell) != float(val) if val != "" else cell != val
+   416→            except ValueError:
+   417→                return cell != val
+   418→        elif op == "contains":
+   419→            return val.lower() in cell.lower()
+   420→        elif op == "not_contains":
+   421→            return val.lower() not in cell.lower()
+   422→        elif op == "starts_with":
+   423→            return cell.lower().startswith(val.lower())
+   424→        elif op == "ends_with":
+   425→            return cell.lower().endswith(val.lower())
+   426→        elif op == "greater_than":
+   427→            try:
+   428→                return float(cell) > float(val)
+   429→            except ValueError:
+   430→                return cell > val
+   431→        elif op == "less_than":
+   432→            try:
+   433→                return float(cell) < float(val)
+   434→            except ValueError:
+   435→                return cell < val
+   436→        elif op == "greater_or_equal":
+   437→            try:
+   438→                return float(cell) >= float(val)
+   439→            except ValueError:
+   440→                return cell >= val
+   441→        elif op == "less_or_equal":
+   442→            try:
+   443→                return float(cell) <= float(val)
+   444→            except ValueError:
+   445→                return cell <= val
+   446→        elif op == "is_empty":
+   447→            return cell.strip() == ""
+   448→        elif op == "is_not_empty":
+   449→            return cell.strip() != ""
+   450→        return True
+   451→
+   452→    dicts = df.to_dict("records")
+   453→    if combine_with == "OR":
+   454→        filtered = [r for r in dicts if any(apply_condition(r, c) for c in conditions)]
+   455→    else:
+   456→        filtered = [r for r in dicts if all(apply_condition(r, c) for c in conditions)]
+   457→
+   458→    filtered_df = pd.DataFrame(filtered) if filtered else pd.DataFrame(columns=df.columns)
+   459→    base_name = Path(filepath).stem
+   460→    info = save_df_to_file(filtered_df, base_name, "filtered")
+   461→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "filter", info["filepath"])
+   462→
+   463→    return {
+   464→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   465→        "filename": info["filename"], "totalRows": len(df),
+   466→        "matchedRows": len(filtered), "removedRows": len(df) - len(filtered),
+   467→        "conditions": conditions, "combineWith": combine_with, "preview": filtered[:10],
+   468→    }
+   469→
+   470→
+   471→def tool_replace(args):
+   472→    filepath = args.get("filepath", "")
+   473→    find = args.get("find", "")
+   474→    replace = args.get("replace", "")
+   475→    scope_columns = args.get("columns", [])
+   476→    match_mode = args.get("matchMode", "contains")
+   477→    case_sensitive = args.get("caseSensitive", "false") == "true"
+   478→    use_regex = args.get("useRegex", "false") == "true"
+   479→
+   480→    if not filepath:
+   481→        return {"error": "File is required"}
+   482→    if not find:
+   483→        return {"error": "Find text is required"}
+   484→
+   485→    df = read_file_to_df(filepath)
+   486→    if df.empty:
+   487→        return {"error": "File is empty"}
+   488→
+   489→    all_columns = list(df.columns)
+   490→    target_columns = [c for c in scope_columns if c in all_columns] if scope_columns else all_columns
+   491→    if not target_columns:
+   492→        return {"error": "No matching columns found"}
+   493→
+   494→    flags = 0 if case_sensitive else re.IGNORECASE
+   495→    try:
+   496→        if use_regex:
+   497→            pattern = re.compile(find, flags)
+   498→        else:
+   499→            escaped = re.escape(find)
+   500→            if match_mode == "exact":
+   501→                pattern = re.compile(f"^{escaped}$", flags)
+   502→            elif match_mode == "startsWith":
+   503→                pattern = re.compile(f"^{escaped}", flags)
+   504→            elif match_mode == "endsWith":
+   505→                pattern = re.compile(f"{escaped}$", flags)
+   506→            else:
+   507→                pattern = re.compile(escaped, flags)
+   508→    except re.error:
+   509→        return {"error": "Invalid regex pattern"}
+   510→
+   511→    total_matches = 0
+   512→    cells_changed = 0
+   513→    rows_affected = set()
+   514→    changes = []
+   515→
+   516→    for idx, row in df.iterrows():
+   517→        for col in target_columns:
+   518→            original = str(row[col])
+   519→            new_val, count = pattern.subn(replace, original)
+   520→            if count > 0:
+   521→                total_matches += count
+   522→                cells_changed += 1
+   523→                rows_affected.add(idx)
+   524→                df.at[idx, col] = new_val
+   525→                if len(changes) < 50:
+   526→                    changes.append({
+   527→                        "row": idx + 1, "column": col,
+   528→                        "before": original[:80], "after": new_val[:80],
+   529→                    })
+   530→
+   531→    base_name = Path(filepath).stem
+   532→    info = save_df_to_file(df, base_name, "replaced")
+   533→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "replace", info["filepath"])
+   534→
+   535→    return {
+   536→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   537→        "filename": info["filename"], "totalRows": len(df),
+   538→        "scopedColumns": target_columns, "matchMode": "regex" if use_regex else match_mode,
+   539→        "caseSensitive": case_sensitive, "totalMatches": total_matches,
+   540→        "cellsChanged": cells_changed, "rowsAffected": len(rows_affected),
+   541→        "changes": changes, "preview": df_to_dicts(df.head(10)),
+   542→    }
+   543→
+   544→
+   545→def tool_transpose(args):
+   546→    filepath = args.get("filepath", "")
+   547→    mode = args.get("mode", "transpose")
+   548→    id_columns = args.get("idColumns", [])
+   549→    var_name = args.get("varName", "variable")
+   550→    value_name = args.get("valueName", "value")
+   551→
+   552→    if not filepath:
+   553→        return {"error": "File is required"}
+   554→
+   555→    df = read_file_to_df(filepath)
+   556→    if df.empty:
+   557→        return {"error": "File is empty"}
+   558→
+   559→    columns = list(df.columns)
+   560→
+   561→    if mode == "transpose":
+   562→        transposed = df.T.reset_index()
+   563→        transposed.columns = ["Column"] + [f"Row {i+1}" for i in range(len(df))]
+   564→        result_df = transposed
+   565→        output_columns = list(result_df.columns)
+   566→    else:
+   567→        if not id_columns:
+   568→            return {"error": "Select at least one ID column for unpivot"}
+   569→        value_cols = [c for c in columns if c not in id_columns]
+   570→        if not value_cols:
+   571→            return {"error": "No value columns to unpivot"}
+   572→        result_df = df.melt(id_vars=id_columns, value_vars=value_cols, var_name=var_name, value_name=value_name)
+   573→        output_columns = list(result_df.columns)
+   574→
+   575→    base_name = Path(filepath).stem
+   576→    suffix = "transposed" if mode == "transpose" else "unpivoted"
+   577→    info = save_df_to_file(result_df, base_name, suffix)
+   578→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "transpose", info["filepath"])
+   579→
+   580→    return {
+   581→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   582→        "filename": info["filename"], "mode": mode,
+   583→        "inputRows": len(df), "inputColumns": len(columns),
+   584→        "outputRows": len(result_df), "outputColumns": output_columns,
+   585→        "preview": df_to_dicts(result_df.head(20)),
+   586→    }
+   587→
+   588→
+   589→def tool_pivot(args):
+   590→    filepath = args.get("filepath", "")
+   591→    group_by = args.get("groupBy", [])
+   592→    aggregations = args.get("aggregations", [])
+   593→
+   594→    if not filepath:
+   595→        return {"error": "File is required"}
+   596→    if not group_by:
+   597→        return {"error": "Select at least one column to group by"}
+   598→    if not aggregations:
+   599→        return {"error": "Add at least one aggregation"}
+   600→
+   601→    df = read_file_to_df(filepath)
+   602→    if df.empty:
+   603→        return {"error": "File is empty"}
+   604→
+   605→    for c in group_by:
+   606→        if c not in df.columns:
+   607→            return {"error": f"Group-by column '{c}' not found"}
+   608→
+   609→    agg_dict = {}
+   610→    rename_map = {}
+   611→    for a in aggregations:
+   612→        col = a["column"]
+   613→        fn = a["function"]
+   614→        alias = a.get("alias") or f"{col}_{fn}"
+   615→        if fn != "count" and col not in df.columns:
+   616→            return {"error": f"Aggregation column '{col}' not found"}
+   617→
+   618→        pandas_fn = {"sum": "sum", "avg": "mean", "count": "count", "count_distinct": "nunique",
+   619→                     "min": "min", "max": "max", "first": "first", "last": "last"}.get(fn, "count")
+   620→
+   621→        key = f"{col}_{fn}_{alias}"
+   622→        agg_dict[key] = pd.NamedAgg(column=col, aggfunc=pandas_fn)
+   623→        rename_map[key] = alias
+   624→
+   625→    for a in aggregations:
+   626→        col = a["column"]
+   627→        if a["function"] in ("sum", "avg", "min", "max"):
+   628→            df[col] = pd.to_numeric(df[col], errors="coerce")
+   629→
+   630→    grouped = df.groupby(group_by, dropna=False).agg(**agg_dict).reset_index()
+   631→    grouped = grouped.rename(columns=rename_map)
+   632→
+   633→    first_col = group_by[0]
+   634→    try:
+   635→        grouped[first_col] = pd.to_numeric(grouped[first_col], errors="coerce")
+   636→    except Exception:
+   637→        pass
+   638→    grouped = grouped.sort_values(first_col, ascending=True, na_position="last").reset_index(drop=True)
+   639→
+   640→    base_name = Path(filepath).stem
+   641→    info = save_df_to_file(grouped, base_name, "pivot")
+   642→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "pivot", info["filepath"])
+   643→
+   644→    return {
+   645→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   646→        "filename": info["filename"], "totalRows": len(df),
+   647→        "groupCount": len(grouped), "groupBy": group_by,
+   648→        "aggregations": aggregations, "preview": df_to_dicts(grouped.head(20)),
+   649→    }
+   650→
+   651→
+   652→def tool_validate(args):
+   653→    filepath = args.get("filepath", "")
+   654→    if not filepath:
+   655→        return {"error": "File is required"}
+   656→
+   657→    df = read_file_to_df(filepath)
+   658→    if df.empty:
+   659→        return {"error": "File is empty"}
+   660→
+   661→    checks = args.get("checks", ["empty_cells", "mixed_types", "duplicate_keys", "email_format",
+   662→                                   "url_format", "date_format", "constant_columns", "whitespace",
+   663→                                   "unique_counts", "outliers"])
+   664→    primary_key = args.get("primaryKey", "")
+   665→    email_cols = args.get("emailColumns", [])
+   666→    url_cols = args.get("urlColumns", [])
+   667→    date_cols = args.get("dateColumns", [])
+   668→
+   669→    issues = []
+   670→    column_reports = []
+   671→
+   672→    email_re = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+   673→    url_re = re.compile(r"^(https?://|www\.)[^\s]+$", re.IGNORECASE)
+   674→    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?Z?)?$")
+   675→
+   676→    for col in df.columns:
+   677→        values = df[col].tolist()
+   678→        non_empty = [v for v in values if v != "" and v is not None]
+   679→        empty_cells = len(values) - len(non_empty)
+   680→        whitespace_only = sum(1 for v in values if isinstance(v, str) and v != "" and v.strip() == "")
+   681→        unique_set = set(str(v) for v in non_empty)
+   682→
+   683→        nums = sum(1 for v in non_empty if str(v).replace(".", "").replace("-", "").isdigit())
+   684→        texts = len(non_empty) - nums
+   685→        detected_type = "number" if nums == len(non_empty) else "text" if texts == len(non_empty) else "mixed"
+   686→        is_constant = len(non_empty) > 0 and len(unique_set) == 1
+   687→
+   688→        report = {
+   689→            "column": col, "totalCells": len(values), "emptyCells": empty_cells,
+   690→            "whitespaceOnly": whitespace_only, "uniqueValues": len(unique_set),
+   691→            "detectedType": detected_type, "isConstant": is_constant,
+   692→        }
+   693→
+   694→        if detected_type == "number" and non_empty:
+   695→            num_vals = [float(v) for v in non_empty]
+   696→            report["min"] = min(num_vals)
+   697→            report["max"] = max(num_vals)
+   698→            report["mean"] = round(sum(num_vals) / len(num_vals), 4)
+   699→        elif non_empty:
+   700→            str_vals = [str(v) for v in non_empty]
+   701→            report["min"] = min(str_vals)
+   702→            report["max"] = max(str_vals)
+   703→
+   704→        column_reports.append(report)
+   705→
+   706→        if "empty_cells" in checks:
+   707→            for i, v in enumerate(values):
+   708→                if v == "" or v is None:
+   709→                    issues.append({"row": i + 1, "column": col, "value": v, "message": "Empty cell", "severity": "info"})
+   710→
+   711→        if "whitespace" in checks:
+   712→            for i, v in enumerate(values):
+   713→                if isinstance(v, str) and v != "" and v.strip() == "":
+   714→                    issues.append({"row": i + 1, "column": col, "value": v, "message": "Whitespace-only cell", "severity": "warning"})
+   715→
+   716→        if "constant_columns" in checks and is_constant:
+   717→            issues.append({"row": 0, "column": col, "value": non_empty[0],
+   718→                          "message": f'Column is constant — every non-empty cell is "{non_empty[0]}"', "severity": "info"})
+   719→
+   720→        if "email_format" in checks and col in email_cols:
+   721→            for i, v in enumerate(values):
+   722→                if v and not email_re.match(str(v)):
+   723→                    issues.append({"row": i + 1, "column": col, "value": v, "message": "Invalid email format", "severity": "error"})
+   724→
+   725→        if "url_format" in checks and col in url_cols:
+   726→            for i, v in enumerate(values):
+   727→                if v and not url_re.match(str(v)):
+   728→                    issues.append({"row": i + 1, "column": col, "value": v, "message": "Invalid URL format", "severity": "error"})
+   729→
+   730→        if "date_format" in checks and col in date_cols:
+   731→            for i, v in enumerate(values):
+   732→                if v and not date_re.match(str(v)):
+   733→                    issues.append({"row": i + 1, "column": col, "value": v, "message": "Invalid date format", "severity": "error"})
+   734→
+   735→    if "duplicate_keys" in checks and primary_key:
+   736→        seen = {}
+   737→        for i, row in df.iterrows():
+   738→            v = str(row[primary_key])
+   739→            if v == "":
+   740→                continue
+   741→            if v not in seen:
+   742→                seen[v] = []
+   743→            seen[v].append(i + 1)
+   744→        for v, rows in seen.items():
+   745→            if len(rows) > 1:
+   746→                issues.append({"row": rows[0], "column": primary_key, "value": v,
+   747→                              "message": f'Duplicate primary key "{v}" appears in rows: {", ".join(map(str, rows))}',
+   748→                              "severity": "error"})
+   749→
+   750→    total_cells = len(df) * len(df.columns)
+   751→    summary = {
+   752→        "totalRows": len(df), "totalColumns": len(df.columns), "totalCells": total_cells,
+   753→        "emptyCells": sum(r["emptyCells"] for r in column_reports),
+   754→        "uniqueIssues": len(issues),
+   755→        "errors": sum(1 for i in issues if i["severity"] == "error"),
+   756→        "warnings": sum(1 for i in issues if i["severity"] == "warning"),
+   757→        "infos": sum(1 for i in issues if i["severity"] == "info"),
+   758→        "constantColumns": sum(1 for r in column_reports if r["isConstant"]),
+   759→        "mixedTypeColumns": sum(1 for r in column_reports if r["detectedType"] == "mixed"),
+   760→    }
+   761→    overall_score = max(0, round(100 - ((summary["errors"] * 5 + summary["warnings"] * 2 + summary["infos"] * 0.5) / max(1, total_cells)) * 100))
+   762→
+   763→    base_name = Path(filepath).stem
+   764→    info = save_df_to_file(pd.DataFrame(), base_name, "validation")
+   765→    with pd.ExcelWriter(info["filepath"], engine="openpyxl") as writer:
+   766→        summary_data = [{"Metric": k, "Value": v} for k, v in summary.items()] + [{"Metric": "Quality Score", "Value": f"{overall_score}/100"}]
+   767→        pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
+   768→        col_data = [{"Column": r["column"], "Type": r["detectedType"], "Total Cells": r["totalCells"],
+   769→                     "Empty Cells": r["emptyCells"], "Whitespace-only": r["whitespaceOnly"],
+   770→                     "Unique Values": r["uniqueValues"], "Constant": "Yes" if r["isConstant"] else "No",
+   771→                     "Min": r.get("min", ""), "Max": r.get("max", ""), "Mean": r.get("mean", "")}
+   772→                    for r in column_reports]
+   773→        pd.DataFrame(col_data).to_excel(writer, sheet_name="Columns", index=False)
+   774→        issue_data = [{"Row": i["row"], "Column": i["column"], "Value": str(i["value"]),
+   775→                       "Severity": i["severity"], "Message": i["message"]} for i in issues[:1000]]
+   776→        if issue_data:
+   777→            pd.DataFrame(issue_data).to_excel(writer, sheet_name="Issues", index=False)
+   778→
+   779→    info["size"] = Path(info["filepath"]).stat().st_size
+   780→    record_file(info["filename"], args.get("originalName", ""), info["mime"], info["size"], "validate", info["filepath"])
+   781→
+   782→    return {
+   783→        "success": True, "downloadUrl": f"/api/tools/download?file={info['filename']}",
+   784→        "filename": info["filename"], "summary": summary, "overallScore": overall_score,
+   785→        "columnReports": column_reports, "issues": issues[:200], "checksRun": checks,
+   786→    }
+   787→
+   788→
+   789→def tool_attendance(args):
+   790→    filepath = args.get("filepath", "")
+   791→    column = args.get("column", "")
+   792→    roll_number = args.get("rollNumber", "")
+   793→
+   794→    if not filepath or not column or not roll_number:
+   795→        return {"error": "File, column, and roll number are required"}
+   796→
+   797→    df = read_file_to_df(filepath)
+   798→    if df.empty:
+   799→        return {"error": "File is empty"}
+   800→
+   801→    student_rows = df[df[column].astype(str).str.strip() == roll_number.strip()]
+   802→    if student_rows.empty:
+   803→        return {"error": f"No records found for roll number: {roll_number}"}
+   804→
+   805→    all_columns = list(df.columns)
+   806→    class_columns = [c for c in all_columns if c != column]
+   807→
+   808→    if class_columns:
+   809→        student_record = student_rows.iloc[0]
+   810→        total = len(class_columns)
+   811→        present = 0
+   812→        details = []
+   813→        for col in class_columns:
+   814→            val = str(student_record[col] or "").strip().lower()
+   815→            is_present = val in ("present", "p", "1", "yes", "true")
+   816→            if is_present:
+   817→                present += 1
+   818→            details.append({"class": col, "status": str(student_record[col] or "N/A")})
+   819→
+   820→        report = {
+   821→            "rollNumber": roll_number, "totalClasses": total,
+   822→            "presentCount": present, "absentCount": total - present,
+   823→            "attendancePercentage": f"{(present / total * 100):.2f}" if total > 0 else "0.00",
+   824→            "details": details,
+   825→        }
+   826→    else:
+   827→        total_classes = len(df)
+   828→        present_count = len(student_rows)
+   829→        report = {
+   830→            "rollNumber": roll_number, "totalClasses": total_classes,
+   831→            "presentCount": present_count, "absentCount": total_classes - present_count,
+   832→            "attendancePercentage": f"{(present_count / total_classes * 100):.2f}" if total_classes > 0 else "0.00",
+   833→        }
+   834→
+   835→    return {"success": True, "report": report}
+   836→
+   837→
+   838→def tool_preview(args):
+   839→    filename = args.get("file", "")
+   840→    rows = args.get("rows", 50)
+   841→    if not filename:
+   842→        return {"error": "Filename is required"}
+   843→
+   844→    safe_name = Path(filename).name
+   845→    filepath = DOWNLOAD_DIR / safe_name
+   846→    if not filepath.is_file():
+   847→        return {"error": "File not found"}
+   848→
+   849→    ext = filepath.suffix.lower()
+   850→    if ext == ".csv":
+   851→        df = pd.read_csv(filepath, dtype=str, keep_default_na=False).fillna("")
+   852→    else:
+   853→        df = pd.read_excel(filepath, engine="openpyxl", dtype=str, keep_default_na=False).fillna("")
+   854→
+   855→    columns = list(df.columns) if not df.empty else []
+   856→    return {
+   857→        "success": True, "sheetName": "Sheet1", "totalRows": len(df),
+   858→        "columns": columns, "data": df_to_dicts(df.head(rows)),
+   859→    }
+   860→
+   861→
+   862→def tool_history_get(args):
+   863→    try:
+   864→        conn = get_db()
+   865→        rows = conn.execute("SELECT * FROM FileRecord ORDER BY createdAt DESC LIMIT 50").fetchall()
+   866→        conn.close()
+   867→        records = [dict(r) for r in rows]
+   868→        return {"success": True, "records": records}
+   869→    except Exception as e:
+   870→        return {"error": str(e)}
+   871→
+   872→
+   873→def tool_history_delete(args):
+   874→    record_id = args.get("id", "")
+   875→    try:
+   876→        conn = get_db()
+   877→        if record_id:
+   878→            record = conn.execute("SELECT * FROM FileRecord WHERE id = ?", (record_id,)).fetchone()
+   879→            if not record:
+   880→                conn.close()
+   881→                return {"error": "Record not found"}
+   882→            if record["outputPath"]:
+   883→                try:
+   884→                    Path(record["outputPath"]).unlink()
+   885→                except Exception:
+   886→                    pass
+   887→            conn.execute("DELETE FROM FileRecord WHERE id = ?", (record_id,))
+   888→            conn.commit()
+   889→            conn.close()
+   890→            return {"success": True, "message": "Record deleted"}
+   891→        else:
+   892→            records = conn.execute("SELECT outputPath FROM FileRecord").fetchall()
+   893→            for r in records:
+   894→                if r["outputPath"]:
+   895→                    try:
+   896→                        Path(r["outputPath"]).unlink()
+   897→                    except Exception:
+   898→                        pass
+   899→            count = len(records)
+   900→            conn.execute("DELETE FROM FileRecord")
+   901→            conn.commit()
+   902→            conn.close()
+   903→            return {"success": True, "message": f"Cleared {count} records"}
+   904→    except Exception as e:
+   905→        return {"error": str(e)}
+   906→
+   907→
+   908→def tool_errors_get(args):
+   909→    try:
+   910→        conn = get_db()
+   911→        rows = conn.execute("SELECT * FROM ErrorLog ORDER BY createdAt DESC LIMIT 50").fetchall()
+   912→        conn.close()
+   913→        records = [dict(r) for r in rows]
+   914→        return {"success": True, "records": records}
+   915→    except Exception as e:
+   916→        return {"error": str(e)}
+   917→
+   918→
+   919→# ─── Main dispatcher ───────────────────────────────────────────────────────────
+   920→
+   921→TOOLS = {
+   922→    "merge": tool_merge,
+   923→    "columns": tool_columns,
+   924→    "duplicates": tool_duplicates,
+   925→    "convert": tool_convert,
+   926→    "stats": tool_stats,
+   927→    "sort": tool_sort,
+   928→    "filter": tool_filter,
+   929→    "replace": tool_replace,
+   930→    "transpose": tool_transpose,
+   931→    "pivot": tool_pivot,
+   932→    "validate": tool_validate,
+   933→    "attendance": tool_attendance,
+   934→    "preview": tool_preview,
+   935→    "history_get": tool_history_get,
+   936→    "history_delete": tool_history_delete,
+   937→    "errors_get": tool_errors_get,
+   938→}
+   939→
+   940→
+   941→def main():
+   942→    if len(sys.argv) < 3:
+   943→        print(json.dumps({"error": "Usage: cli.py <tool> <json_args_file>"}))
+   944→        sys.exit(1)
+   945→
+   946→    tool_name = sys.argv[1]
+   947→    args_file = sys.argv[2]
+   948→
+   949→    try:
+   950→        with open(args_file, "r") as f:
+   951→            args = json.load(f)
+   952→    except Exception as e:
+   953→        print(json.dumps({"error": f"Failed to read args: {e}"}))
+   954→        sys.exit(1)
+   955→
+   956→    handler = TOOLS.get(tool_name)
+   957→    if not handler:
+   958→        print(json.dumps({"error": f"Unknown tool: {tool_name}"}))
+   959→        sys.exit(1)
+   960→
+   961→    try:
+   962→        result = handler(args)
+   963→        print(json.dumps(result, default=str))
+   964→    except Exception as e:
+   965→        log_error(tool_name, str(e))
+   966→        print(json.dumps({"error": str(e)}))
+   967→        sys.exit(1)
+   968→
+   969→
+   970→if __name__ == "__main__":
+   971→    main()
+   972→

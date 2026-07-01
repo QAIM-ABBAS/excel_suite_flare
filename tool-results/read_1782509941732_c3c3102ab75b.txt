@@ -1,0 +1,704 @@
+     1→"use client"
+     2→
+     3→import { useState } from "react"
+     4→import { FileDropzone } from "@/components/file-dropzone"
+     5→import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+     6→import { Button } from "@/components/ui/button"
+     7→import { Input } from "@/components/ui/input"
+     8→import { Label } from "@/components/ui/label"
+     9→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+    10→import { Progress } from "@/components/ui/progress"
+    11→import { Badge } from "@/components/ui/badge"
+    12→import { DataTable } from "@/components/data-table"
+    13→import { DataPreviewDialog } from "@/components/data-preview-dialog"
+    14→import {
+    15→  ShieldCheck, Download, CheckCircle2, Loader2, Eye, RotateCcw, Zap,
+    16→  AlertTriangle, AlertCircle, Info, TrendingUp, Type, Hash, Calendar, ToggleLeft,
+    17→} from "lucide-react"
+    18→import { toast } from "sonner"
+    19→import { motion, AnimatePresence } from "framer-motion"
+    20→import { useAppStore } from "@/lib/store"
+    21→
+    22→type CheckName =
+    23→  | "empty_cells"
+    24→  | "mixed_types"
+    25→  | "duplicate_keys"
+    26→  | "email_format"
+    27→  | "url_format"
+    28→  | "date_format"
+    29→  | "constant_columns"
+    30→  | "whitespace"
+    31→  | "unique_counts"
+    32→  | "outliers"
+    33→
+    34→interface Issue {
+    35→  row: number
+    36→  column: string
+    37→  value: unknown
+    38→  message: string
+    39→  severity: "info" | "warning" | "error"
+    40→}
+    41→
+    42→interface ColumnReport {
+    43→  column: string
+    44→  totalCells: number
+    45→  emptyCells: number
+    46→  whitespaceOnly: number
+    47→  uniqueValues: number
+    48→  detectedType: "number" | "text" | "date" | "boolean" | "mixed"
+    49→  isConstant: boolean
+    50→  min?: number | string
+    51→  max?: number | string
+    52→  mean?: number
+    53→}
+    54→
+    55→interface ValidateResult {
+    56→  downloadUrl: string
+    57→  filename: string
+    58→  summary: {
+    59→    totalRows: number
+    60→    totalColumns: number
+    61→    totalCells: number
+    62→    emptyCells: number
+    63→    uniqueIssues: number
+    64→    errors: number
+    65→    warnings: number
+    66→    infos: number
+    67→    constantColumns: number
+    68→    mixedTypeColumns: number
+    69→  }
+    70→  overallScore: number
+    71→  columnReports: ColumnReport[]
+    72→  issues: Issue[]
+    73→  checksRun: CheckName[]
+    74→}
+    75→
+    76→const AVAILABLE_CHECKS: { id: CheckName; label: string; description: string; needsInput?: "primary" | "email" | "url" | "date" }[] = [
+    77→  { id: "empty_cells", label: "Empty Cells", description: "Flag any blank cells" },
+    78→  { id: "whitespace", label: "Whitespace-only", description: "Cells that only contain spaces" },
+    79→  { id: "mixed_types", label: "Mixed Types", description: "Non-numeric values in numeric columns" },
+    80→  { id: "constant_columns", label: "Constant Columns", description: "Columns where every value is identical" },
+    81→  { id: "outliers", label: "Outliers (IQR)", description: "Statistical outliers in numeric columns" },
+    82→  { id: "duplicate_keys", label: "Duplicate Primary Keys", description: "Repeated values in primary key column", needsInput: "primary" },
+    83→  { id: "email_format", label: "Email Format", description: "Validate email pattern", needsInput: "email" },
+    84→  { id: "url_format", label: "URL Format", description: "Validate URL pattern", needsInput: "url" },
+    85→  { id: "date_format", label: "Date Format", description: "Validate YYYY-MM-DD format", needsInput: "date" },
+    86→]
+    87→
+    88→const typeIconMap: Record<string, typeof Hash> = {
+    89→  number: Hash,
+    90→  text: Type,
+    91→  date: Calendar,
+    92→  boolean: ToggleLeft,
+    93→  mixed: AlertTriangle,
+    94→}
+    95→
+    96→const typeColorMap: Record<string, string> = {
+    97→  number: "bg-cyan-500/10 text-cyan-500",
+    98→  text: "bg-violet-500/10 text-violet-500",
+    99→  date: "bg-amber-500/10 text-amber-500",
+   100→  boolean: "bg-emerald-500/10 text-emerald-500",
+   101→  mixed: "bg-rose-500/10 text-rose-500",
+   102→}
+   103→
+   104→export function ValidateTool() {
+   105→  const { incrementActiveTasks, decrementActiveTasks, pushNotification } = useAppStore()
+   106→  const [file, setFile] = useState<File | null>(null)
+   107→  const [columns, setColumns] = useState<string[]>([])
+   108→  const [preview, setPreview] = useState<Record<string, unknown>[]>([])
+   109→  const [isLoadingColumns, setIsLoadingColumns] = useState(false)
+   110→  const [isProcessing, setIsProcessing] = useState(false)
+   111→  const [progress, setProgress] = useState(0)
+   112→  const [result, setResult] = useState<ValidateResult | null>(null)
+   113→  const [previewOpen, setPreviewOpen] = useState(false)
+   114→
+   115→  // Check selection
+   116→  const [checks, setChecks] = useState<CheckName[]>([
+   117→    "empty_cells",
+   118→    "whitespace",
+   119→    "mixed_types",
+   120→    "constant_columns",
+   121→    "outliers",
+   122→  ])
+   123→
+   124→  // Format-specific column assignments
+   125→  const [primaryKey, setPrimaryKey] = useState<string>("")
+   126→  const [emailColumns, setEmailColumns] = useState<string[]>([])
+   127→  const [urlColumns, setUrlColumns] = useState<string[]>([])
+   128→  const [dateColumns, setDateColumns] = useState<string[]>([])
+   129→
+   130→  const handleFileSelected = async (files: File[]) => {
+   131→    const selected = files[0]
+   132→    setFile(selected)
+   133→    setResult(null)
+   134→    setIsLoadingColumns(true)
+   135→    try {
+   136→      const formData = new FormData()
+   137→      formData.append("file", selected)
+   138→      const response = await fetch("/api/tools/columns", { method: "POST", body: formData })
+   139→      const data = await response.json()
+   140→      if (data.success && data.sheets.length > 0) {
+   141→        setColumns(data.sheets[0].columns)
+   142→        setPreview(data.preview || [])
+   143→        setPrimaryKey("")
+   144→        setEmailColumns([])
+   145→        setUrlColumns([])
+   146→        setDateColumns([])
+   147→      }
+   148→    } catch {
+   149→      toast.error("Failed to read file columns")
+   150→    } finally {
+   151→      setIsLoadingColumns(false)
+   152→    }
+   153→  }
+   154→
+   155→  const toggleCheck = (id: CheckName) => {
+   156→    setChecks((prev) => (prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id]))
+   157→  }
+   158→
+   159→  const toggleColumnInList = (col: string, list: string[], setter: (v: string[]) => void) => {
+   160→    setter(list.includes(col) ? list.filter((c) => c !== col) : [...list, col])
+   161→  }
+   162→
+   163→  const canRun = file && checks.length > 0
+   164→
+   165→  const handleValidate = async () => {
+   166→    if (!file) return
+   167→    setIsProcessing(true)
+   168→    setProgress(10)
+   169→    incrementActiveTasks()
+   170→    try {
+   171→      const formData = new FormData()
+   172→      formData.append("file", file)
+   173→      formData.append("checks", JSON.stringify(checks))
+   174→      if (primaryKey) formData.append("primaryKey", primaryKey)
+   175→      if (emailColumns.length > 0) formData.append("emailColumns", JSON.stringify(emailColumns))
+   176→      if (urlColumns.length > 0) formData.append("urlColumns", JSON.stringify(urlColumns))
+   177→      if (dateColumns.length > 0) formData.append("dateColumns", JSON.stringify(dateColumns))
+   178→
+   179→      setProgress(40)
+   180→      const response = await fetch("/api/tools/validate", { method: "POST", body: formData })
+   181→      const data = await response.json()
+   182→      setProgress(90)
+   183→
+   184→      if (data.success) {
+   185→        setResult(data)
+   186→        setProgress(100)
+   187→        const score = data.overallScore
+   188→        const severity = score >= 80 ? "success" : score >= 50 ? "warning" : "error"
+   189→        pushNotification({
+   190→          title: "Validation complete",
+   191→          description: `Quality score ${score}/100 — ${data.summary.errors} errors, ${data.summary.warnings} warnings`,
+   192→          type: severity,
+   193→        })
+   194→        toast.success(`Validation complete — score ${score}/100`)
+   195→      } else {
+   196→        toast.error(data.error || "Validation failed")
+   197→        pushNotification({ title: "Validation failed", description: data.error, type: "error" })
+   198→      }
+   199→    } catch (e) {
+   200→      const msg = e instanceof Error ? e.message : "Unknown error"
+   201→      toast.error(msg)
+   202→      pushNotification({ title: "Validation failed", description: msg, type: "error" })
+   203→    } finally {
+   204→      setIsProcessing(false)
+   205→      setTimeout(() => setProgress(0), 800)
+   206→      decrementActiveTasks()
+   207→    }
+   208→  }
+   209→
+   210→  const handleReset = () => {
+   211→    setFile(null)
+   212→    setColumns([])
+   213→    setPreview([])
+   214→    setResult(null)
+   215→    setChecks(["empty_cells", "whitespace", "mixed_types", "constant_columns", "outliers"])
+   216→    setPrimaryKey("")
+   217→    setEmailColumns([])
+   218→    setUrlColumns([])
+   219→    setDateColumns([])
+   220→  }
+   221→
+   222→  const scoreColor =
+   223→    result && result.overallScore >= 80
+   224→      ? "text-emerald-500"
+   225→      : result && result.overallScore >= 50
+   226→      ? "text-amber-500"
+   227→      : "text-rose-500"
+   228→
+   229→  return (
+   230→    <div className="space-y-6 max-w-6xl mx-auto">
+   231→      <div className="space-y-1">
+   232→        <div className="flex items-center gap-2">
+   233→          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-lime-500/10">
+   234→            <ShieldCheck className="h-5 w-5 text-lime-500" />
+   235→          </div>
+   236→          <div>
+   237→            <h2 className="text-xl font-bold tracking-tight">Data Validation / Quality Check</h2>
+   238→            <p className="text-sm text-muted-foreground">
+   239→              Scan for empty cells, type mismatches, duplicate keys, format violations, and outliers
+   240→            </p>
+   241→          </div>
+   242→        </div>
+   243→      </div>
+   244→
+   245→      <Card>
+   246→        <CardHeader>
+   247→          <CardTitle className="text-base flex items-center gap-2">
+   248→            <span>1. Upload File</span>
+   249→            {file && (
+   250→              <Badge variant="secondary" className="text-[10px] gap-1">
+   251→                <CheckCircle2 className="h-2.5 w-2.5 text-emerald-500" />
+   252→                {file.name}
+   253→              </Badge>
+   254→            )}
+   255→          </CardTitle>
+   256→        </CardHeader>
+   257→        <CardContent>
+   258→          {!file ? (
+   259→            <FileDropzone onFilesSelected={handleFileSelected} />
+   260→          ) : (
+   261→            <div className="flex items-center justify-between rounded-lg border border-border/50 bg-muted/30 p-3">
+   262→              <div className="flex items-center gap-2 min-w-0">
+   263→                <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
+   264→                <span className="text-sm truncate">{file.name}</span>
+   265→                <Badge variant="outline" className="text-[10px]">{(file.size / 1024).toFixed(1)} KB</Badge>
+   266→                {columns.length > 0 && <Badge variant="outline" className="text-[10px]">{columns.length} cols</Badge>}
+   267→              </div>
+   268→              <div className="flex items-center gap-2 shrink-0">
+   269→                <Button size="sm" variant="ghost" onClick={() => setPreviewOpen(true)} className="h-7 text-xs">
+   270→                  <Eye className="mr-1 h-3 w-3" /> Preview
+   271→                </Button>
+   272→                <Button size="sm" variant="ghost" onClick={handleReset} className="h-7 text-xs">
+   273→                  <RotateCcw className="mr-1 h-3 w-3" /> Reset
+   274→                </Button>
+   275→              </div>
+   276→            </div>
+   277→          )}
+   278→          {isLoadingColumns && (
+   279→            <div className="flex items-center gap-2 mt-3 text-xs text-muted-foreground">
+   280→              <Loader2 className="h-3 w-3 animate-spin" />
+   281→              Reading columns…
+   282→            </div>
+   283→          )}
+   284→        </CardContent>
+   285→      </Card>
+   286→
+   287→      {columns.length > 0 && (
+   288→        <Card>
+   289→          <CardHeader>
+   290→            <CardTitle className="text-base">2. Select Checks</CardTitle>
+   291→            <CardDescription>Toggle the checks you want to run on your data</CardDescription>
+   292→          </CardHeader>
+   293→          <CardContent className="space-y-4">
+   294→            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+   295→              {AVAILABLE_CHECKS.map((check) => {
+   296→                const active = checks.includes(check.id)
+   297→                return (
+   298→                  <motion.button
+   299→                    key={check.id}
+   300→                    type="button"
+   301→                    whileHover={{ scale: 1.01 }}
+   302→                    whileTap={{ scale: 0.99 }}
+   303→                    onClick={() => toggleCheck(check.id)}
+   304→                    className={`text-left rounded-lg border p-3 transition-all ${
+   305→                      active
+   306→                        ? "border-lime-500/40 bg-lime-500/5 shadow-sm"
+   307→                        : "border-border/50 bg-card hover:border-lime-500/20"
+   308→                    }`}
+   309→                  >
+   310→                    <div className="flex items-start gap-2">
+   311→                      <div className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+   312→                        active ? "border-lime-500 bg-lime-500 text-white" : "border-muted-foreground/30"
+   313→                      }`}>
+   314→                        {active && <CheckCircle2 className="h-3 w-3" />}
+   315→                      </div>
+   316→                      <div className="min-w-0">
+   317→                        <div className="text-sm font-medium">{check.label}</div>
+   318→                        <div className="text-[11px] text-muted-foreground">{check.description}</div>
+   319→                      </div>
+   320→                    </div>
+   321→                  </motion.button>
+   322→                )
+   323→              })}
+   324→            </div>
+   325→
+   326→            {/* Conditional inputs based on selected checks */}
+   327→            <AnimatePresence>
+   328→              {checks.includes("duplicate_keys") && (
+   329→                <motion.div
+   330→                  initial={{ opacity: 0, height: 0 }}
+   331→                  animate={{ opacity: 1, height: "auto" }}
+   332→                  exit={{ opacity: 0, height: 0 }}
+   333→                  className="overflow-hidden"
+   334→                >
+   335→                  <div className="rounded-lg border border-border/50 bg-muted/30 p-3 space-y-2">
+   336→                    <Label className="text-xs">Primary Key Column (for duplicate detection)</Label>
+   337→                    <Select value={primaryKey} onValueChange={setPrimaryKey}>
+   338→                      <SelectTrigger className="h-8 text-sm">
+   339→                        <SelectValue placeholder="Select a column" />
+   340→                      </SelectTrigger>
+   341→                      <SelectContent>
+   342→                        {columns.map((col) => (
+   343→                          <SelectItem key={col} value={col}>{col}</SelectItem>
+   344→                        ))}
+   345→                      </SelectContent>
+   346→                    </Select>
+   347→                  </div>
+   348→                </motion.div>
+   349→              )}
+   350→            </AnimatePresence>
+   351→
+   352→            <AnimatePresence>
+   353→              {(checks.includes("email_format") || checks.includes("url_format") || checks.includes("date_format")) && columns.length > 0 && (
+   354→                <motion.div
+   355→                  initial={{ opacity: 0, height: 0 }}
+   356→                  animate={{ opacity: 1, height: "auto" }}
+   357→                  exit={{ opacity: 0, height: 0 }}
+   358→                  className="overflow-hidden space-y-3"
+   359→                >
+   360→                  {checks.includes("email_format") && (
+   361→                    <div className="rounded-lg border border-border/50 bg-muted/30 p-3 space-y-2">
+   362→                      <Label className="text-xs flex items-center gap-1.5">
+   363→                        <span className="h-2 w-2 rounded-full bg-rose-500" />
+   364→                        Email Columns — click to toggle
+   365→                      </Label>
+   366→                      <div className="flex flex-wrap gap-1.5">
+   367→                        {columns.map((col) => {
+   368→                          const active = emailColumns.includes(col)
+   369→                          return (
+   370→                            <button
+   371→                              key={col}
+   372→                              type="button"
+   373→                              onClick={() => toggleColumnInList(col, emailColumns, setEmailColumns)}
+   374→                              className={`rounded-full px-2.5 py-1 text-xs transition-all border ${
+   375→                                active
+   376→                                  ? "border-rose-500/40 bg-rose-500/15 text-rose-500"
+   377→                                  : "border-border/50 bg-card hover:border-rose-500/20"
+   378→                              }`}
+   379→                            >
+   380→                              {col}
+   381→                            </button>
+   382→                          )
+   383→                        })}
+   384→                      </div>
+   385→                    </div>
+   386→                  )}
+   387→                  {checks.includes("url_format") && (
+   388→                    <div className="rounded-lg border border-border/50 bg-muted/30 p-3 space-y-2">
+   389→                      <Label className="text-xs flex items-center gap-1.5">
+   390→                        <span className="h-2 w-2 rounded-full bg-sky-500" />
+   391→                        URL Columns — click to toggle
+   392→                      </Label>
+   393→                      <div className="flex flex-wrap gap-1.5">
+   394→                        {columns.map((col) => {
+   395→                          const active = urlColumns.includes(col)
+   396→                          return (
+   397→                            <button
+   398→                              key={col}
+   399→                              type="button"
+   400→                              onClick={() => toggleColumnInList(col, urlColumns, setUrlColumns)}
+   401→                              className={`rounded-full px-2.5 py-1 text-xs transition-all border ${
+   402→                                active
+   403→                                  ? "border-sky-500/40 bg-sky-500/15 text-sky-500"
+   404→                                  : "border-border/50 bg-card hover:border-sky-500/20"
+   405→                              }`}
+   406→                            >
+   407→                              {col}
+   408→                            </button>
+   409→                          )
+   410→                        })}
+   411→                      </div>
+   412→                    </div>
+   413→                  )}
+   414→                  {checks.includes("date_format") && (
+   415→                    <div className="rounded-lg border border-border/50 bg-muted/30 p-3 space-y-2">
+   416→                      <Label className="text-xs flex items-center gap-1.5">
+   417→                        <span className="h-2 w-2 rounded-full bg-amber-500" />
+   418→                        Date Columns — click to toggle
+   419→                      </Label>
+   420→                      <div className="flex flex-wrap gap-1.5">
+   421→                        {columns.map((col) => {
+   422→                          const active = dateColumns.includes(col)
+   423→                          return (
+   424→                            <button
+   425→                              key={col}
+   426→                              type="button"
+   427→                              onClick={() => toggleColumnInList(col, dateColumns, setDateColumns)}
+   428→                              className={`rounded-full px-2.5 py-1 text-xs transition-all border ${
+   429→                                active
+   430→                                  ? "border-amber-500/40 bg-amber-500/15 text-amber-500"
+   431→                                  : "border-border/50 bg-card hover:border-amber-500/20"
+   432→                              }`}
+   433→                            >
+   434→                              {col}
+   435→                            </button>
+   436→                          )
+   437→                        })}
+   438→                      </div>
+   439→                    </div>
+   440→                  )}
+   441→                </motion.div>
+   442→              )}
+   443→            </AnimatePresence>
+   444→
+   445→            <div className="flex items-center gap-2 pt-1">
+   446→              <Button
+   447→                onClick={handleValidate}
+   448→                disabled={!canRun || isProcessing}
+   449→                className="bg-lime-600 hover:bg-lime-700 text-white"
+   450→              >
+   451→                {isProcessing ? (
+   452→                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+   453→                ) : (
+   454→                  <ShieldCheck className="mr-2 h-4 w-4" />
+   455→                )}
+   456→                Run Validation
+   457→              </Button>
+   458→              <Badge variant="outline" className="text-[10px]">
+   459→                {checks.length} check{checks.length === 1 ? "" : "s"} selected
+   460→              </Badge>
+   461→            </div>
+   462→
+   463→            {progress > 0 && (
+   464→              <Progress value={progress} className="h-1" />
+   465→            )}
+   466→          </CardContent>
+   467→        </Card>
+   468→      )}
+   469→
+   470→      {/* Results */}
+   471→      {result && (
+   472→        <motion.div
+   473→          initial={{ opacity: 0, y: 10 }}
+   474→          animate={{ opacity: 1, y: 0 }}
+   475→          className="space-y-4"
+   476→        >
+   477→          {/* Score hero */}
+   478→          <Card className="relative overflow-hidden border-lime-500/20">
+   479→            <div className="absolute -top-12 -right-12 h-40 w-40 rounded-full bg-lime-500/10 blur-3xl" />
+   480→            <CardContent className="relative pt-6">
+   481→              <div className="flex items-center justify-between flex-wrap gap-4">
+   482→                <div className="space-y-2">
+   483→                  <div className="flex items-center gap-2">
+   484→                    <ShieldCheck className={`h-5 w-5 ${scoreColor}`} />
+   485→                    <h3 className="text-lg font-semibold">Quality Report</h3>
+   486→                    <Badge variant="secondary" className="text-[10px]">
+   487→                      {result.filename}
+   488→                    </Badge>
+   489→                  </div>
+   490→                  <div className="flex items-baseline gap-3">
+   491→                    <span className={`text-5xl font-bold tabular-nums ${scoreColor}`}>
+   492→                      {result.overallScore}
+   493→                    </span>
+   494→                    <span className="text-sm text-muted-foreground">/ 100 quality score</span>
+   495→                  </div>
+   496→                  <div className="flex items-center gap-3 text-xs">
+   497→                    <span className="flex items-center gap-1 text-rose-500">
+   498→                      <AlertCircle className="h-3 w-3" />
+   499→                      {result.summary.errors} errors
+   500→                    </span>
+   501→                    <span className="flex items-center gap-1 text-amber-500">
+   502→                      <AlertTriangle className="h-3 w-3" />
+   503→                      {result.summary.warnings} warnings
+   504→                    </span>
+   505→                    <span className="flex items-center gap-1 text-sky-500">
+   506→                      <Info className="h-3 w-3" />
+   507→                      {result.summary.infos} info
+   508→                    </span>
+   509→                  </div>
+   510→                </div>
+   511→                <div className="flex items-center gap-2">
+   512→                  <Button asChild>
+   513→                    <a href={result.downloadUrl} download>
+   514→                      <Download className="mr-2 h-4 w-4" />
+   515→                      Download Report
+   516→                    </a>
+   517→                  </Button>
+   518→                </div>
+   519→              </div>
+   520→            </CardContent>
+   521→          </Card>
+   522→
+   523→          {/* Summary stats grid */}
+   524→          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+   525→            <Card className="bg-gradient-to-br from-sky-500/10 to-transparent border-sky-500/20">
+   526→              <CardContent className="pt-4 pb-4">
+   527→                <p className="text-xs text-muted-foreground">Total Cells</p>
+   528→                <p className="text-2xl font-bold tabular-nums">{result.summary.totalCells}</p>
+   529→                <p className="text-[10px] text-muted-foreground mt-1">{result.summary.totalRows} rows × {result.summary.totalColumns} cols</p>
+   530→              </CardContent>
+   531→            </Card>
+   532→            <Card className="bg-gradient-to-br from-rose-500/10 to-transparent border-rose-500/20">
+   533→              <CardContent className="pt-4 pb-4">
+   534→                <p className="text-xs text-muted-foreground">Empty Cells</p>
+   535→                <p className="text-2xl font-bold tabular-nums">{result.summary.emptyCells}</p>
+   536→                <p className="text-[10px] text-muted-foreground mt-1">
+   537→                  {result.summary.totalCells > 0 ? ((result.summary.emptyCells / result.summary.totalCells) * 100).toFixed(1) : 0}% of cells
+   538→                </p>
+   539→              </CardContent>
+   540→            </Card>
+   541→            <Card className="bg-gradient-to-br from-amber-500/10 to-transparent border-amber-500/20">
+   542→              <CardContent className="pt-4 pb-4">
+   543→                <p className="text-xs text-muted-foreground">Constant Columns</p>
+   544→                <p className="text-2xl font-bold tabular-nums">{result.summary.constantColumns}</p>
+   545→                <p className="text-[10px] text-muted-foreground mt-1">Single-value columns</p>
+   546→              </CardContent>
+   547→            </Card>
+   548→            <Card className="bg-gradient-to-br from-fuchsia-500/10 to-transparent border-fuchsia-500/20">
+   549→              <CardContent className="pt-4 pb-4">
+   550→                <p className="text-xs text-muted-foreground">Mixed-Type Columns</p>
+   551→                <p className="text-2xl font-bold tabular-nums">{result.summary.mixedTypeColumns}</p>
+   552→                <p className="text-[10px] text-muted-foreground mt-1">Type inconsistencies</p>
+   553→              </CardContent>
+   554→            </Card>
+   555→          </div>
+   556→
+   557→          {/* Column reports */}
+   558→          <Card>
+   559→            <CardHeader>
+   560→              <CardTitle className="text-base flex items-center gap-2">
+   561→                <Type className="h-4 w-4" />
+   562→                Column Reports
+   563→              </CardTitle>
+   564→              <CardDescription>Detailed statistics for each column</CardDescription>
+   565→            </CardHeader>
+   566→            <CardContent>
+   567→              <div className="overflow-x-auto rounded-md border border-border/50 max-h-96 overflow-y-auto">
+   568→                <table className="w-full text-xs">
+   569→                  <thead className="sticky top-0 bg-muted/80 backdrop-blur z-10">
+   570→                    <tr className="border-b border-border/50">
+   571→                      <th className="text-left p-2 font-medium">Column</th>
+   572→                      <th className="text-left p-2 font-medium">Type</th>
+   573→                      <th className="text-right p-2 font-medium">Empty</th>
+   574→                      <th className="text-right p-2 font-medium">Whitespace</th>
+   575→                      <th className="text-right p-2 font-medium">Unique</th>
+   576→                      <th className="text-left p-2 font-medium">Min</th>
+   577→                      <th className="text-left p-2 font-medium">Max</th>
+   578→                      <th className="text-right p-2 font-medium">Mean</th>
+   579→                      <th className="text-center p-2 font-medium">Constant</th>
+   580→                    </tr>
+   581→                  </thead>
+   582→                  <tbody>
+   583→                    {result.columnReports.map((col, idx) => {
+   584→                      const TypeIcon = typeIconMap[col.detectedType] || Type
+   585→                      return (
+   586→                        <tr key={col.column} className={`border-b border-border/30 ${idx % 2 === 0 ? "" : "bg-muted/20"}`}>
+   587→                          <td className="p-2 font-medium">{col.column}</td>
+   588→                          <td className="p-2">
+   589→                            <Badge variant="outline" className={`text-[10px] gap-1 ${typeColorMap[col.detectedType]}`}>
+   590→                              <TypeIcon className="h-2.5 w-2.5" />
+   591→                              {col.detectedType}
+   592→                            </Badge>
+   593→                          </td>
+   594→                          <td className="p-2 text-right tabular-nums">
+   595→                            {col.emptyCells > 0 ? (
+   596→                              <span className="text-rose-500 font-medium">{col.emptyCells}</span>
+   597→                            ) : (
+   598→                              <span className="text-muted-foreground">0</span>
+   599→                            )}
+   600→                          </td>
+   601→                          <td className="p-2 text-right tabular-nums">
+   602→                            {col.whitespaceOnly > 0 ? (
+   603→                              <span className="text-amber-500 font-medium">{col.whitespaceOnly}</span>
+   604→                            ) : (
+   605→                              <span className="text-muted-foreground">0</span>
+   606→                            )}
+   607→                          </td>
+   608→                          <td className="p-2 text-right tabular-nums">{col.uniqueValues}</td>
+   609→                          <td className="p-2 text-muted-foreground truncate max-w-32">{String(col.min ?? "—")}</td>
+   610→                          <td className="p-2 text-muted-foreground truncate max-w-32">{String(col.max ?? "—")}</td>
+   611→                          <td className="p-2 text-right tabular-nums">{col.mean ?? "—"}</td>
+   612→                          <td className="p-2 text-center">
+   613→                            {col.isConstant ? (
+   614→                              <Badge variant="outline" className="text-[10px] bg-amber-500/10 text-amber-500 border-amber-500/30">Yes</Badge>
+   615→                            ) : (
+   616→                              <span className="text-muted-foreground">—</span>
+   617→                            )}
+   618→                          </td>
+   619→                        </tr>
+   620→                      )
+   621→                    })}
+   622→                  </tbody>
+   623→                </table>
+   624→              </div>
+   625→            </CardContent>
+   626→          </Card>
+   627→
+   628→          {/* Issues list */}
+   629→          {result.issues.length > 0 && (
+   630→            <Card>
+   631→              <CardHeader>
+   632→                <CardTitle className="text-base flex items-center gap-2">
+   633→                  <AlertCircle className="h-4 w-4 text-rose-500" />
+   634→                  Issues Found
+   635→                  <Badge variant="secondary" className="text-[10px]">{result.issues.length} shown</Badge>
+   636→                </CardTitle>
+   637→                <CardDescription>First 200 issues — full list in downloaded report</CardDescription>
+   638→              </CardHeader>
+   639→              <CardContent>
+   640→                <div className="max-h-96 overflow-y-auto rounded-md border border-border/50">
+   641→                  <table className="w-full text-xs">
+   642→                    <thead className="sticky top-0 bg-muted/80 backdrop-blur z-10">
+   643→                      <tr className="border-b border-border/50">
+   644→                        <th className="text-left p-2 font-medium">Row</th>
+   645→                        <th className="text-left p-2 font-medium">Column</th>
+   646→                        <th className="text-left p-2 font-medium">Value</th>
+   647→                        <th className="text-center p-2 font-medium">Severity</th>
+   648→                        <th className="text-left p-2 font-medium">Message</th>
+   649→                      </tr>
+   650→                    </thead>
+   651→                    <tbody>
+   652→                      {result.issues.map((issue, idx) => (
+   653→                        <tr key={idx} className={`border-b border-border/30 ${idx % 2 === 0 ? "" : "bg-muted/20"}`}>
+   654→                          <td className="p-2 tabular-nums">{issue.row === 0 ? "—" : issue.row}</td>
+   655→                          <td className="p-2 font-medium">{issue.column}</td>
+   656→                          <td className="p-2 font-mono text-muted-foreground truncate max-w-32">{String(issue.value ?? "")}</td>
+   657→                          <td className="p-2 text-center">
+   658→                            <Badge
+   659→                              variant="outline"
+   660→                              className={`text-[10px] ${
+   661→                                issue.severity === "error"
+   662→                                  ? "bg-rose-500/10 text-rose-500 border-rose-500/30"
+   663→                                  : issue.severity === "warning"
+   664→                                  ? "bg-amber-500/10 text-amber-500 border-amber-500/30"
+   665→                                  : "bg-sky-500/10 text-sky-500 border-sky-500/30"
+   666→                              }`}
+   667→                            >
+   668→                              {issue.severity}
+   669→                            </Badge>
+   670→                          </td>
+   671→                          <td className="p-2 text-muted-foreground">{issue.message}</td>
+   672→                        </tr>
+   673→                      ))}
+   674→                    </tbody>
+   675→                  </table>
+   676→                </div>
+   677→              </CardContent>
+   678→            </Card>
+   679→          )}
+   680→
+   681→          {result.issues.length === 0 && (
+   682→            <Card className="border-emerald-500/30 bg-emerald-500/5">
+   683→              <CardContent className="flex items-center justify-center py-10">
+   684→                <div className="text-center">
+   685→                  <CheckCircle2 className="h-12 w-12 text-emerald-500 mx-auto mb-2" />
+   686→                  <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">No issues found</p>
+   687→                  <p className="text-xs text-muted-foreground mt-1">Your data passes all selected checks</p>
+   688→                </div>
+   689→              </CardContent>
+   690→            </Card>
+   691→          )}
+   692→        </motion.div>
+   693→      )}
+   694→
+   695→      <DataPreviewDialog
+   696→        open={previewOpen}
+   697→        onOpenChange={setPreviewOpen}
+   698→        data={preview}
+   699→        title="Original File Preview"
+   700→      />
+   701→    </div>
+   702→  )
+   703→}
+   704→

@@ -1,0 +1,7 @@
+{
+  "name": "api-service",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "python3 -u /home/z/my-project/mini-services/api-service/main.py"
+  }
+}
