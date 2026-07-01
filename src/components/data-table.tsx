@@ -17,6 +17,7 @@ import { ChevronLeft, ChevronRight, Search, Inbox } from "lucide-react"
 interface DataTableProps {
   data: Record<string, unknown>[]
   maxRows?: number
+  maxHeight?: number
   searchable?: boolean
   emptyMessage?: string
   highlightRow?: (row: Record<string, unknown>, index: number) => boolean
@@ -25,6 +26,7 @@ interface DataTableProps {
 export function DataTable({
   data,
   maxRows = 50,
+  maxHeight,
   searchable = true,
   emptyMessage = "No data to display",
   highlightRow,
@@ -82,7 +84,7 @@ export function DataTable({
       )}
 
       <div className="rounded-lg border border-border/50 overflow-hidden">
-        <div className="max-h-72 overflow-auto">
+        <div className="overflow-auto" style={maxHeight ? { maxHeight: `${maxHeight}px` } : { maxHeight: '288px' }}>
           <Table>
             <TableHeader className="sticky top-0 bg-muted/50 backdrop-blur-sm z-10">
               <TableRow className="border-border/50 hover:bg-transparent">
