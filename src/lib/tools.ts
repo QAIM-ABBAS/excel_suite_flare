@@ -232,7 +232,7 @@ export async function toolStats(args: {
     return { error: "File is empty" };
   const sheet = sheets[0];
 
-  const stats = [];
+  const stats: Record<string, unknown>[] = [];
   for (const col of sheet.columns) {
     const values = sheet.rows.map((r) => r[col]);
     const nonEmpty = values.filter((v) => v != null && v !== "");
@@ -300,7 +300,7 @@ export async function toolStats(args: {
           Value: tv.value,
           Count: String(tv.count),
           "Percent of Filled":
-            s.count > 0 ? `${((tv.count / Number(s.count)) * 100).toFixed(1)}%` : "0.0%",
+            Number(s.count) > 0 ? `${((tv.count / Number(s.count)) * 100).toFixed(1)}%` : "0.0%",
         });
       }
     }
@@ -713,7 +713,8 @@ export async function toolPivot(args: {
       if (a.function === "count") {
         out[alias] = String(fn(groupRows.map(() => 1)));
       } else if (a.function === "count_distinct") {
-        out[alias] = String(fn(groupRows.map((r) => String(r[a.column] ?? ""))));
+        const distinctValues = new Set(groupRows.map((r) => String(r[a.column] ?? "")));
+        out[alias] = String(distinctValues.size);
       } else {
         const vals = groupRows
           .map((r) => toNum(r[a.column]))

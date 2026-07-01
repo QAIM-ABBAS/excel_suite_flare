@@ -16,7 +16,8 @@ import { apiFetch } from "@/lib/api"
 interface DataPreviewDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  filename: string
+  filename?: string
+  data?: Record<string, unknown>[]
   title?: string
 }
 
@@ -31,6 +32,7 @@ export function DataPreviewDialog({
   open,
   onOpenChange,
   filename,
+  data: initialData,
   title = "Data Preview",
 }: DataPreviewDialogProps) {
   const [loading, setLoading] = useState(false)
@@ -38,8 +40,29 @@ export function DataPreviewDialog({
   const [error, setError] = useState<string | null>(null)
   const loadingRef = useRef<string | null>(null)
 
+  // Handle direct data prop
   useEffect(() => {
-    if (!open || !filename) return
+    if (initialData && initialData.length > 0) {
+      const columns = Object.keys(initialData[0])
+      setData({
+        sheetName: "Preview",
+        totalRows: initialData.length,
+        columns,
+        data: initialData,
+      })
+    } else if (initialData) {
+      setData({
+        sheetName: "Preview",
+        totalRows: 0,
+        columns: [],
+        data: [],
+      })
+    }
+  }, [initialData])
+
+  // Handle filename prop - fetch from API
+  useEffect(() => {
+    if (!open || !filename || initialData) return
     if (loadingRef.current === filename) return
     loadingRef.current = filename
 
@@ -72,7 +95,7 @@ export function DataPreviewDialog({
       cancelled = true
       loadingRef.current = null
     }
-  }, [open, filename])
+  }, [open, filename, initialData])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
