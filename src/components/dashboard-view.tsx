@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { GitMerge, ArrowLeftRight, CopyX, UserCheck, Download, ImageDown, FileSpreadsheet, Clock, ArrowRight, Zap, Shield, Sparkles, ArrowUpDown, TrendingUp, Activity, Filter, BarChart3, Table2, Clock3, Replace, ShieldCheck, FlipHorizontal2, X, type LucideIcon } from "lucide-react"
 import { motion } from "framer-motion"
 import { useEffect, useState } from "react"
+import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface ToolMeta {
   id: ToolView
@@ -226,7 +227,7 @@ export function DashboardView() {
   const [toolStats, setToolStats] = useState<Record<string, number>>({})
 
   useEffect(() => {
-    fetch("/api/tools/history")
+    apiFetch("/api/tools/history")
       .then(res => res.json())
       .then(data => {
         if (data.success) {
@@ -461,7 +462,7 @@ export function DashboardView() {
                   </div>
                   {file.status === "completed" && (
                     <a
-                      href={`/api/tools/download?file=${encodeURIComponent(file.filename)}`}
+                      href={downloadUrl(`/api/tools/download?file=${encodeURIComponent(file.filename)}`)}
                       className="opacity-0 group-hover:opacity-100 transition-opacity"
                     >
                       <Button variant="ghost" size="icon" className="h-7 w-7">

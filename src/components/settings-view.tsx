@@ -13,6 +13,7 @@ import { FileSpreadsheet, Clock, AlertTriangle, Trash2, Download, Loader2, Searc
 import { useSyncExternalStore, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import { motion, AnimatePresence } from "framer-motion"
+import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface FileRecord {
   id: string
@@ -89,7 +90,7 @@ export function SettingsView() {
   const fetchFileHistory = async () => {
     setLoadingHistory(true)
     try {
-      const res = await fetch("/api/tools/history")
+      const res = await apiFetch("/api/tools/history")
       const data = await res.json()
       if (data.success) setFileHistory(data.records)
     } catch {
@@ -102,7 +103,7 @@ export function SettingsView() {
   const fetchErrorLogs = async () => {
     setLoadingErrors(true)
     try {
-      const res = await fetch("/api/tools/errors")
+      const res = await apiFetch("/api/tools/errors")
       const data = await res.json()
       if (data.success) setErrorLogs(data.records)
     } catch {
@@ -134,7 +135,7 @@ export function SettingsView() {
 
   const handleDeleteRecord = async (id: string) => {
     try {
-      const res = await fetch(`/api/tools/history?id=${encodeURIComponent(id)}`, { method: "DELETE" })
+      const res = await apiFetch(`/api/tools/history?id=${encodeURIComponent(id)}`, { method: "DELETE" })
       const data = await res.json()
       if (data.success) {
         toast.success("Record deleted")
@@ -151,7 +152,7 @@ export function SettingsView() {
     if (fileHistory.length === 0) return
     if (!confirm(`Delete all ${fileHistory.length} file records? This cannot be undone.`)) return
     try {
-      const res = await fetch("/api/tools/history", { method: "DELETE" })
+      const res = await apiFetch("/api/tools/history", { method: "DELETE" })
       const data = await res.json()
       if (data.success) {
         toast.success(data.message || "All records cleared")
@@ -166,7 +167,7 @@ export function SettingsView() {
 
   const handleExportJson = async () => {
     try {
-      const res = await fetch("/api/tools/history")
+      const res = await apiFetch("/api/tools/history")
       const data = await res.json()
       if (!data.success) throw new Error("Failed to fetch records")
       const blob = new Blob([JSON.stringify(data.records, null, 2)], {
@@ -420,7 +421,7 @@ export function SettingsView() {
                         <div className="flex items-center gap-1 shrink-0">
                           {file.status === "completed" && (
                             <a
-                              href={`/api/tools/download?file=${encodeURIComponent(file.filename)}`}
+                              href={downloadUrl(`/api/tools/download?file=${encodeURIComponent(file.filename)}`)}
                               className="inline-flex items-center gap-1 text-[10px] text-primary hover:underline"
                               title="Download file"
                             >

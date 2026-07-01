@@ -1,19 +1,24 @@
 /**
  * Central API utility.
- * API requests are handled by Next.js API routes which invoke the Python backend.
- * Frontend can call /api/tools/* directly.
+ * API requests are handled by Cloudflare Workers backend.
+ * Frontend calls the Worker URL for all API operations.
  */
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
+
 /**
- * Fetch wrapper for API calls. Just a passthrough since Next.js handles the proxying.
+ * Fetch wrapper for API calls.
+ * Prepends the Worker URL to the path.
  */
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(path, init);
+  const url = API_BASE ? `${API_BASE}${path}` : path;
+  return fetch(url, init);
 }
 
 /**
- * Build a download URL. Just returns the path directly.
+ * Build a download URL.
+ * Returns the full URL to the Worker endpoint.
  */
 export function downloadUrl(path: string): string {
-  return path;
+  return API_BASE ? `${API_BASE}${path}` : path;
 }
