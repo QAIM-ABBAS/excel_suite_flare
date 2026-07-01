@@ -182,6 +182,10 @@ async function dispatchTool(
       return toolValidate(args, db);
     case 'attendance':
       return toolAttendance(args);
+    case 'download-excel':
+      return toolDownloadExcel(args, db);
+    case 'download-images':
+      return toolDownloadImages(args, db);
     default:
       return { error: `Unknown tool: ${tool}` };
   }
@@ -1110,4 +1114,328 @@ async function toolAttendance(args: {
       attendancePercentage: totalClasses > 0 ? ((presentCount / totalClasses) * 100).toFixed(2) : '0.00',
     },
   };
+}
+
+// ─── Tool: download-excel ────────────────────────────────────────────────────
+async function toolDownloadExcel(args: { url?: string; originalName?: string }, db: Database) {
+  const url = args.url || '';
+  if (!url) return { error: 'URL is required' };
+
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return { error: `HTTP ${resp.status}: ${resp.statusText}` };
+    const buf = await resp.arrayBuffer();
+
+    const urlFilename = decodeURIComponent(url.split('?')[0].split('/').pop() || 'downloaded');
+    const ext = urlFilename.split('.').pop() || 'xlsx';
+    const stem = urlFilename.split('.').slice(0, -1).join('.') || 'downloaded';
+    const filename = generateFilename(stem, ext);
+
+    await db.recordFile(filename, urlFilename, 'application/octet-stream', buf.byteLength, 'download-excel', '');
+
+    return createDownloadResponse(buf, filename, 'application/octet-stream');
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'Download failed' };
+  }
+}
+
+// ─── Tool: download-images ───────────────────────────────────────────────────
+
+function detectImageFormat(buf: ArrayBuffer): {
+  ext: string;
+  mimeType: string;
+  isSupported: boolean;
+} {
+  const bytes = new Uint8Array(buf);
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+    return { ext: 'jpeg', mimeType: 'image/jpeg', isSupported: true };
+
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47)
+    return { ext: 'png', mimeType: 'image/png', isSupported: true };
+
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46)
+    return { ext: 'gif', mimeType: 'image/gif', isSupported: true };
+
+  if (bytes[0] === 0x42 && bytes[1] === 0x4d)
+    return { ext: 'bmp', mimeType: 'image/bmp', isSupported: true };
+
+  // WEBP: RIFF....WEBP
+  if (
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  )
+    return { ext: 'webp', mimeType: 'image/webp', isSupported: true };
+
+  // Unknown — likely HTML error page or corrupted
+  return { ext: 'jpeg', mimeType: 'image/jpeg', isSupported: false };
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function toolDownloadImages(args: {
+  fileId?: string;
+  urlColumn?: string;
+  originalName?: string;
+  selectedColumns?: string[];
+}, db: Database) {
+  const { fileId, urlColumn, originalName = 'images', selectedColumns } = args;
+
+  if (!fileId) return { error: 'File path is required' };
+  if (!urlColumn) return { error: 'URL column is required' };
+
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
+
+  const sheets = readBufferToRows(buffer, originalName);
+  if (!sheets.length) return { error: 'No sheets found in file' };
+  const sheet = sheets[0];
+
+  if (!sheet.columns.includes(urlColumn)) {
+    return { error: `Column "${urlColumn}" not found in file` };
+  }
+
+  // Download all images
+  const results: { row: number; url: string; status: string; error?: string }[] = [];
+  const imageBuffers: (ArrayBuffer | null)[] = [];
+
+  for (let i = 0; i < sheet.rows.length; i++) {
+    const url = (sheet.rows[i][urlColumn] || '').trim();
+    if (!url) {
+      results.push({ row: i + 1, url: '', status: 'skipped' });
+      imageBuffers.push(null);
+      continue;
+    }
+
+    let currentUrl = url;
+    let finalBuf: ArrayBuffer | null = null;
+
+    try {
+      // Try up to 2 times (first try = original URL, second try = extracted URL)
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const resp = await fetch(currentUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          signal: AbortSignal.timeout(30000),
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        const buf = await resp.arrayBuffer();
+        const contentType = resp.headers.get('content-type') || '';
+
+        // Check if the response is HTML
+        const textStart = new TextDecoder().decode(buf.slice(0, 100)).trimStart();
+        const isHtml = contentType.includes('text/html') ||
+                       textStart.startsWith('<!DOCTYPE') ||
+                       textStart.startsWith('<html');
+
+        if (isHtml) {
+          if (attempt === 0) {
+            // We got the HTML wrapper. Try to extract the real link from the JavaScript inside.
+            const htmlText = new TextDecoder().decode(buf);
+
+            // Look for URLs pointing to storage, or ending in image extensions
+            const match = htmlText.match(/https?:\/\/[^"'\s]+responses\.storage[^"'\s]+/i) ||
+                          htmlText.match(/https?:\/\/[^"'\s]+\.(?:jpeg|jpg|png|webp|gif)[^"'\s]*/i);
+
+            if (match && match[0] && match[0] !== currentUrl) {
+              currentUrl = match[0]; // Switch to the real link
+              continue; // Loop again to fetch the actual image
+            }
+          }
+          // If we couldn't find a link, or if this was the second attempt, fail.
+          throw new Error('Server returned HTML page instead of image');
+        }
+
+        // If we get here, it's a binary file (success!)
+        if (buf.byteLength === 0) throw new Error('Empty response body');
+
+        finalBuf = buf;
+        break; // Exit the loop, we have the image
+      }
+
+      if (!finalBuf) throw new Error('Failed to download image buffer');
+
+      imageBuffers.push(finalBuf);
+      results.push({ row: i + 1, url: currentUrl, status: 'success' });
+
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : 'Failed';
+      imageBuffers.push(null);
+      results.push({ row: i + 1, url: currentUrl, status: 'failed', error: errMsg });
+    }
+  }
+
+  // Process images into base64 strings
+  const imageBase64s: (string | null)[] = [];
+
+  for (let i = 0; i < imageBuffers.length; i++) {
+    const buf = imageBuffers[i];
+    if (!buf) {
+      imageBase64s.push(null);
+      continue;
+    }
+
+    try {
+      const { mimeType, isSupported } = detectImageFormat(buf);
+
+      // Skip completely if not a recognized image format
+      if (!isSupported) {
+        results[i].status = 'failed';
+        results[i].error = 'Unrecognized image format (possibly corrupted)';
+        imageBase64s.push(null);
+        continue;
+      }
+
+      // Convert to base64 (no sharp processing in Workers - images kept as-is)
+      const b64 = Buffer.from(buf).toString('base64');
+      imageBase64s.push(`data:${mimeType};base64,${b64}`);
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : 'Image processing failed';
+      results[i].status = 'failed';
+      results[i].error = errMsg;
+      imageBase64s.push(null);
+    }
+  }
+
+  // Build HTML table
+  let otherColumns = sheet.columns.filter((c) => c !== urlColumn);
+  if (selectedColumns && selectedColumns.length > 0) {
+    otherColumns = otherColumns.filter((c) => selectedColumns.includes(c));
+  }
+
+  const headerCells = [
+    '<th>Image</th>',
+    ...otherColumns.map((c) => `<th>${escapeHtml(c)}</th>`),
+  ].join('');
+
+  const bodyRows = sheet.rows.map((row, i) => {
+    const imgSrc = imageBase64s[i];
+    const imgCell = imgSrc
+      ? `<td class="img-cell"><img src="${imgSrc}" /></td>`
+      : `<td class="img-cell empty">${results[i]?.error ? 'Error' : '—'}</td>`;
+
+    const dataCells = otherColumns
+      .map((c) => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`)
+      .join('');
+
+    return `<tr>${imgCell}${dataCells}</tr>`;
+  });
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${escapeHtml(originalName)}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 24px;
+      color: #222;
+    }
+    h1 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #333;
+    }
+    .meta {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 16px;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 600px;
+    }
+    thead tr {
+      background: #f0f0f0;
+    }
+    th {
+      padding: 10px 14px;
+      text-align: left;
+      font-weight: 600;
+      border-bottom: 2px solid #ddd;
+      white-space: nowrap;
+    }
+    td {
+      padding: 8px 14px;
+      border-bottom: 1px solid #eee;
+      vertical-align: middle;
+    }
+    td.img-cell {
+      width: 220px;
+      min-width: 220px;
+      text-align: center;
+      padding: 8px;
+    }
+    td.img-cell img {
+      max-width: 200px;
+      max-height: 200px;
+      border-radius: 4px;
+      display: block;
+      margin: 0 auto;
+    }
+    td.img-cell.empty {
+      color: #bbb;
+      font-size: 12px;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(originalName)}</h1>
+  <p class="meta">
+    ${sheet.rows.length} rows ·
+    ${results.filter((r) => r.status === 'success').length} images loaded ·
+    Generated ${new Date().toLocaleString()}
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>${headerCells}</tr></thead>
+      <tbody>${bodyRows.join('\n')}</tbody>
+    </table>
+  </div>
+</body>
+</html>`;
+
+  const htmlBuffer = new TextEncoder().encode(html).buffer as ArrayBuffer;
+  const filename = generateFilename('images', 'html');
+
+  await db.recordFile(filename, originalName, 'text/html', htmlBuffer.byteLength, 'download-images', '');
+
+  const successCount = results.filter((r) => r.status === 'success').length;
+  const failCount = results.filter((r) => r.status === 'failed').length;
+
+  if (failCount > 0) {
+    const failedLines = results
+      .filter((r) => r.status === 'failed')
+      .map((r) => `Row ${r.row}: ${r.url} — ${r.error || 'unknown'}`)
+      .join('\n');
+    await db.logError('download-images', `${failCount} of ${sheet.rows.length} images failed`, failedLines);
+  }
+
+  return createDownloadResponse(htmlBuffer, filename, 'text/html');
 }
