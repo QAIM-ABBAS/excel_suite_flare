@@ -40,12 +40,13 @@ interface Condition {
 }
 
 interface FilterResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  totalRows: number
-  matchedRows: number
-  removedRows: number
-  preview: Record<string, unknown>[]
+  totalRows?: number
+  matchedRows?: number
+  removedRows?: number
+  preview?: Record<string, unknown>[]
 }
 
 const OPERATORS: { value: Operator; label: string; needsValue: boolean }[] = [
@@ -164,18 +165,48 @@ export function FilterTool() {
         body: formData,
       })
       setProgress(80)
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || "Failed to filter data")
-      setProgress(100)
-      setResult(data)
-      toast.success(
-        `Filtered: ${data.matchedRows} of ${data.totalRows} rows matched (${data.removedRows} removed)`
-      )
-      pushNotification({
-        title: "Filter complete",
-        description: `${data.matchedRows} of ${data.totalRows} rows matched (${conditions.length} condition${conditions.length === 1 ? "" : "s"}, ${combineWith})`,
-        type: data.matchedRows > 0 ? "success" : "warning",
-      })
+
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Failed to filter data")
+        setProgress(100)
+        setResult(data)
+        toast.success(
+          `Filtered: ${data.matchedRows} of ${data.totalRows} rows matched (${data.removedRows} removed)`
+        )
+        pushNotification({
+          title: "Filter complete",
+          description: `${data.matchedRows} of ${data.totalRows} rows matched (${conditions.length} condition${conditions.length === 1 ? "" : "s"}, ${combineWith})`,
+          type: data.matchedRows > 0 ? "success" : "warning",
+        })
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "filtered_data.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Data filtered and file downloaded!")
+        pushNotification({
+          title: "Filter complete",
+          description: `File downloaded: ${filename}`,
+          type: "success",
+        })
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to filter data"
       toast.error(msg)
@@ -379,7 +410,7 @@ export function FilterTool() {
                   </div>
                 </div>
 
-                {result.preview.length > 0 ? (
+                {result.preview && result.preview.length > 0 ? (
                   <div className="space-y-2">
                     <Label className="text-xs text-muted-foreground">Filtered Preview (first 10 rows)</Label>
                     <DataTable data={result.preview} maxRows={10} searchable={false} />
@@ -391,11 +422,22 @@ export function FilterTool() {
                 )}
 
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1" disabled={result.matchedRows === 0}>
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1" disabled={result.matchedRows === 0}>
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    onClick={() => setPreviewOpen(true)}
+                    className="flex-1"
+                    disabled={result.matchedRows === 0}
+                  >
+                    <Eye className="h-4 w-4" />
+                    Preview Full Data
                   </Button>
                   <Button
                     variant="outline"

@@ -37,13 +37,14 @@ interface Aggregation {
 }
 
 interface PivotResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  totalRows: number
-  groupCount: number
-  groupBy: string[]
-  aggregations: Aggregation[]
-  preview: Record<string, unknown>[]
+  totalRows?: number
+  groupCount?: number
+  groupBy?: string[]
+  aggregations?: Aggregation[]
+  preview?: Record<string, unknown>[]
 }
 
 const AGG_FUNCTIONS: { value: AggFn; label: string; needsColumn: boolean }[] = [
@@ -162,18 +163,48 @@ export function PivotTool() {
       setProgress(50)
       const response = await apiFetch("/api/tools/pivot", { method: "POST", body: formData })
       setProgress(80)
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || "Failed to aggregate data")
-      setProgress(100)
-      setResult(data)
-      toast.success(
-        `Aggregated ${data.totalRows} rows into ${data.groupCount} groups`
-      )
-      pushNotification({
-        title: "Pivot complete",
-        description: `${data.totalRows} rows → ${data.groupCount} groups by ${groupBy.join(", ")}`,
-        type: "success",
-      })
+
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Failed to aggregate data")
+        setProgress(100)
+        setResult(data)
+        toast.success(
+          `Aggregated ${data.totalRows} rows into ${data.groupCount} groups`
+        )
+        pushNotification({
+          title: "Pivot complete",
+          description: `${data.totalRows} rows → ${data.groupCount} groups by ${groupBy.join(", ")}`,
+          type: "success",
+        })
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "pivoted_data.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Pivot completed and file downloaded!")
+        pushNotification({
+          title: "Pivot complete",
+          description: `File downloaded: ${filename}`,
+          type: "success",
+        })
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to aggregate data"
       toast.error(msg)
@@ -399,17 +430,17 @@ export function PivotTool() {
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Output Groups</p>
-                    <p className="text-lg font-semibold text-teal-500">{result.groupCount}</p>
+                    <p className="text-lg font-semibold text-teal-500">{result.groupCount || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Group By</p>
-                    <p className="text-sm font-semibold truncate" title={result.groupBy.join(", ")}>
-                      {result.groupBy.join(", ")}
+                    <p className="text-sm font-semibold truncate" title={result.groupBy?.join(", ")}>
+                      {result.groupBy?.join(", ")}
                     </p>
                   </div>
                 </div>
 
-                {result.preview.length > 0 && (
+                {result.preview && result.preview.length > 0 && (
                   <div className="space-y-2">
                     <Label className="text-xs text-muted-foreground">Pivot Preview (first 20 rows)</Label>
                     <DataTable data={result.preview} maxRows={20} searchable />
@@ -417,12 +448,14 @@ export function PivotTool() {
                 )}
 
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1">
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1">
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => setPreviewOpen(true)} className="flex-1">
                     <Eye className="mr-2 h-4 w-4" />
                     Preview Full Data

@@ -21,14 +21,15 @@ import { apiFetch, downloadUrl } from "@/lib/api"
 type Mode = "transpose" | "unpivot"
 
 interface TransposeResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  mode: Mode
-  inputRows: number
-  inputColumns: number
-  outputRows: number
-  outputColumns: string[]
-  preview: Record<string, unknown>[]
+  mode?: Mode
+  inputRows?: number
+  inputColumns?: number
+  outputRows?: number
+  outputColumns?: string[]
+  preview?: Record<string, unknown>[]
 }
 
 export function TransposeTool() {
@@ -93,22 +94,46 @@ export function TransposeTool() {
 
       setProgress(40)
       const response = await apiFetch("/api/tools/transpose", { method: "POST", body: formData })
-      const data = await response.json()
       setProgress(90)
 
-      if (data.success) {
-        setResult(data)
-        setProgress(100)
-        const verb = mode === "transpose" ? "Transposed" : "Unpivoted"
-        pushNotification({
-          title: `${verb} successfully`,
-          description: `${data.inputRows} rows × ${data.inputColumns} cols → ${data.outputRows} rows × ${data.outputColumns.length} cols`,
-          type: "success",
-        })
-        toast.success(`${verb} — ${data.outputRows} rows generated`)
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (data.success) {
+          setResult(data)
+          setProgress(100)
+          const verb = mode === "transpose" ? "Transposed" : "Unpivoted"
+          pushNotification({
+            title: `${verb} successfully`,
+            description: `${data.inputRows} rows × ${data.inputColumns} cols → ${data.outputRows} rows × ${data.outputColumns.length} cols`,
+            type: "success",
+          })
+          toast.success(`${verb} — ${data.outputRows} rows generated`)
+        } else {
+          toast.error(data.error || "Operation failed")
+          pushNotification({ title: "Operation failed", description: data.error, type: "error" })
+        }
       } else {
-        toast.error(data.error || "Operation failed")
-        pushNotification({ title: "Operation failed", description: data.error, type: "error" })
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "transposed_data.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Transpose completed and file downloaded!")
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Unknown error"
@@ -373,15 +398,13 @@ export function TransposeTool() {
                     <h3 className="text-lg font-semibold">
                       {result.mode === "transpose" ? "Transposed" : "Unpivoted"} Successfully
                     </h3>
-                    <Badge variant="secondary" className="text-[10px]">{result.filename}</Badge>
-                  </div>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="rounded-md bg-muted px-2 py-1 tabular-nums">
-                      {result.inputRows} rows × {result.inputColumns} cols
+                    <ArrowRight className="h-3 w-3 text-muted-foreground" />
+                    <span className="rounded-md bg-purple-500/10 text-purple-500 px-2 py-1 tabular-nums">
+                      {result.inputRows || 0} rows × {result.inputColumns || 0} cols
                     </span>
                     <ArrowRight className="h-3 w-3 text-muted-foreground" />
                     <span className="rounded-md bg-purple-500/10 text-purple-500 px-2 py-1 tabular-nums">
-                      {result.outputRows} rows × {result.outputColumns.length} cols
+                      {result.outputRows || 0} rows × {result.outputColumns?.length || 0} cols
                     </span>
                   </div>
                 </div>
@@ -389,12 +412,14 @@ export function TransposeTool() {
                   <Button variant="outline" size="sm" onClick={() => setResultPreviewOpen(true)}>
                     <Eye className="mr-1 h-3.5 w-3.5" /> Preview Result
                   </Button>
-                  <Button asChild>
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild>
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                 </div>
               </div>
             </CardContent>
@@ -409,7 +434,7 @@ export function TransposeTool() {
               <CardDescription>First 20 rows of the result</CardDescription>
             </CardHeader>
             <CardContent>
-              <DataTable data={result.preview} maxHeight={400} />
+              <DataTable data={result.preview || []} maxHeight={400} />
             </CardContent>
           </Card>
         </motion.div>

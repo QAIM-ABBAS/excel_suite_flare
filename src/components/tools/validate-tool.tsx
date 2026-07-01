@@ -54,9 +54,10 @@ interface ColumnReport {
 }
 
 interface ValidateResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  summary: {
+  summary?: {
     totalRows: number
     totalColumns: number
     totalCells: number
@@ -68,10 +69,10 @@ interface ValidateResult {
     constantColumns: number
     mixedTypeColumns: number
   }
-  overallScore: number
-  columnReports: ColumnReport[]
-  issues: Issue[]
-  checksRun: CheckName[]
+  overallScore?: number
+  columnReports?: ColumnReport[]
+  issues?: Issue[]
+  checksRun?: CheckName[]
 }
 
 const AVAILABLE_CHECKS: { id: CheckName; label: string; description: string; needsInput?: "primary" | "email" | "url" | "date" }[] = [
@@ -179,23 +180,47 @@ export function ValidateTool() {
 
       setProgress(40)
       const response = await apiFetch("/api/tools/validate", { method: "POST", body: formData })
-      const data = await response.json()
       setProgress(90)
 
-      if (data.success) {
-        setResult(data)
-        setProgress(100)
-        const score = data.overallScore
-        const severity = score >= 80 ? "success" : score >= 50 ? "warning" : "error"
-        pushNotification({
-          title: "Validation complete",
-          description: `Quality score ${score}/100 — ${data.summary.errors} errors, ${data.summary.warnings} warnings`,
-          type: severity,
-        })
-        toast.success(`Validation complete — score ${score}/100`)
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (data.success) {
+          setResult(data)
+          setProgress(100)
+          const score = data.overallScore
+          const severity = score >= 80 ? "success" : score >= 50 ? "warning" : "error"
+          pushNotification({
+            title: "Validation complete",
+            description: `Quality score ${score}/100 — ${data.summary.errors} errors, ${data.summary.warnings} warnings`,
+            type: severity,
+          })
+          toast.success(`Validation complete — score ${score}/100`)
+        } else {
+          toast.error(data.error || "Validation failed")
+          pushNotification({ title: "Validation failed", description: data.error, type: "error" })
+        }
       } else {
-        toast.error(data.error || "Validation failed")
-        pushNotification({ title: "Validation failed", description: data.error, type: "error" })
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "validation_report.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Validation completed and report downloaded!")
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Unknown error"
@@ -221,9 +246,9 @@ export function ValidateTool() {
   }
 
   const scoreColor =
-    result && result.overallScore >= 80
+    result && (result.overallScore || 0) >= 80
       ? "text-emerald-500"
-      : result && result.overallScore >= 50
+      : result && (result.overallScore || 0) >= 50
       ? "text-amber-500"
       : "text-rose-500"
 
@@ -497,25 +522,27 @@ export function ValidateTool() {
                   <div className="flex items-center gap-3 text-xs">
                     <span className="flex items-center gap-1 text-rose-500">
                       <AlertCircle className="h-3 w-3" />
-                      {result.summary.errors} errors
+                      {result.summary?.errors} errors
                     </span>
                     <span className="flex items-center gap-1 text-amber-500">
                       <AlertTriangle className="h-3 w-3" />
-                      {result.summary.warnings} warnings
+                      {result.summary?.warnings} warnings
                     </span>
                     <span className="flex items-center gap-1 text-sky-500">
                       <Info className="h-3 w-3" />
-                      {result.summary.infos} info
+                      {result.summary?.infos} info
                     </span>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button asChild>
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download Report
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild>
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download Report
+                      </a>
+                    </Button>
+                  )}
                 </div>
               </div>
             </CardContent>
@@ -526,30 +553,30 @@ export function ValidateTool() {
             <Card className="bg-gradient-to-br from-sky-500/10 to-transparent border-sky-500/20">
               <CardContent className="pt-4 pb-4">
                 <p className="text-xs text-muted-foreground">Total Cells</p>
-                <p className="text-2xl font-bold tabular-nums">{result.summary.totalCells}</p>
-                <p className="text-[10px] text-muted-foreground mt-1">{result.summary.totalRows} rows × {result.summary.totalColumns} cols</p>
+                <p className="text-2xl font-bold tabular-nums">{result.summary?.totalCells}</p>
+                <p className="text-[10px] text-muted-foreground mt-1">{result.summary?.totalRows} rows × {result.summary?.totalColumns} cols</p>
               </CardContent>
             </Card>
             <Card className="bg-gradient-to-br from-rose-500/10 to-transparent border-rose-500/20">
               <CardContent className="pt-4 pb-4">
                 <p className="text-xs text-muted-foreground">Empty Cells</p>
-                <p className="text-2xl font-bold tabular-nums">{result.summary.emptyCells}</p>
+                <p className="text-2xl font-bold tabular-nums">{result.summary?.emptyCells}</p>
                 <p className="text-[10px] text-muted-foreground mt-1">
-                  {result.summary.totalCells > 0 ? ((result.summary.emptyCells / result.summary.totalCells) * 100).toFixed(1) : 0}% of cells
+                  {(result.summary?.totalCells || 0) > 0 ? (((result.summary?.emptyCells || 0) / (result.summary?.totalCells || 1)) * 100).toFixed(1) : 0}% of cells
                 </p>
               </CardContent>
             </Card>
             <Card className="bg-gradient-to-br from-amber-500/10 to-transparent border-amber-500/20">
               <CardContent className="pt-4 pb-4">
                 <p className="text-xs text-muted-foreground">Constant Columns</p>
-                <p className="text-2xl font-bold tabular-nums">{result.summary.constantColumns}</p>
+                <p className="text-2xl font-bold tabular-nums">{result.summary?.constantColumns}</p>
                 <p className="text-[10px] text-muted-foreground mt-1">Single-value columns</p>
               </CardContent>
             </Card>
             <Card className="bg-gradient-to-br from-fuchsia-500/10 to-transparent border-fuchsia-500/20">
               <CardContent className="pt-4 pb-4">
                 <p className="text-xs text-muted-foreground">Mixed-Type Columns</p>
-                <p className="text-2xl font-bold tabular-nums">{result.summary.mixedTypeColumns}</p>
+                <p className="text-2xl font-bold tabular-nums">{result.summary?.mixedTypeColumns}</p>
                 <p className="text-[10px] text-muted-foreground mt-1">Type inconsistencies</p>
               </CardContent>
             </Card>
@@ -581,7 +608,7 @@ export function ValidateTool() {
                     </tr>
                   </thead>
                   <tbody>
-                    {result.columnReports.map((col, idx) => {
+                    {(result.columnReports || []).map((col, idx) => {
                       const TypeIcon = typeIconMap[col.detectedType] || Type
                       return (
                         <tr key={col.column} className={`border-b border-border/30 ${idx % 2 === 0 ? "" : "bg-muted/20"}`}>
@@ -627,13 +654,13 @@ export function ValidateTool() {
           </Card>
 
           {/* Issues list */}
-          {result.issues.length > 0 && (
+          {(result.issues || []).length > 0 && (
             <Card>
               <CardHeader>
                 <CardTitle className="text-base flex items-center gap-2">
                   <AlertCircle className="h-4 w-4 text-rose-500" />
                   Issues Found
-                  <Badge variant="secondary" className="text-[10px]">{result.issues.length} shown</Badge>
+                  <Badge variant="secondary" className="text-[10px]">{(result.issues || []).length} shown</Badge>
                 </CardTitle>
                 <CardDescription>First 200 issues — full list in downloaded report</CardDescription>
               </CardHeader>
@@ -650,7 +677,7 @@ export function ValidateTool() {
                       </tr>
                     </thead>
                     <tbody>
-                      {result.issues.map((issue, idx) => (
+                      {(result.issues || []).map((issue, idx) => (
                         <tr key={idx} className={`border-b border-border/30 ${idx % 2 === 0 ? "" : "bg-muted/20"}`}>
                           <td className="p-2 tabular-nums">{issue.row === 0 ? "—" : issue.row}</td>
                           <td className="p-2 font-medium">{issue.column}</td>
@@ -679,7 +706,7 @@ export function ValidateTool() {
             </Card>
           )}
 
-          {result.issues.length === 0 && (
+          {(result.issues || []).length === 0 && (
             <Card className="border-emerald-500/30 bg-emerald-500/5">
               <CardContent className="flex items-center justify-center py-10">
                 <div className="text-center">
@@ -702,3 +729,5 @@ export function ValidateTool() {
     </div>
   )
 }
+
+

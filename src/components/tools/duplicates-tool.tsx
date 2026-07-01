@@ -18,12 +18,13 @@ import { useAppStore } from "@/lib/store"
 import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface DuplicatesResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  totalRows: number
-  duplicateRows: number
-  remainingRows: number
-  preview: {
+  totalRows?: number
+  duplicateRows?: number
+  remainingRows?: number
+  preview?: {
     deleted: Record<string, unknown>[]
     remaining: Record<string, unknown>[]
   }
@@ -95,18 +96,46 @@ export function DuplicatesTool() {
       })
 
       setProgress(80)
-      const data = await response.json()
 
-      if (!response.ok) throw new Error(data.error || "Failed to remove duplicates")
-
-      setProgress(100)
-      setResult(data)
-      toast.success(`Removed ${data.duplicateRows} duplicate rows!`)
-      pushNotification({
-        title: "Duplicates removed",
-        description: `${data.duplicateRows} of ${data.totalRows} rows removed by "${selectedColumn}"`,
-        type: data.duplicateRows > 0 ? "success" : "info",
-      })
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Failed to remove duplicates")
+        setProgress(100)
+        setResult(data)
+        toast.success(`Removed ${data.duplicateRows} duplicate rows!`)
+        pushNotification({
+          title: "Duplicates removed",
+          description: `${data.duplicateRows} of ${data.totalRows} rows removed by "${selectedColumn}"`,
+          type: data.duplicateRows > 0 ? "success" : "info",
+        })
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "cleaned_data.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Duplicates removed and file downloaded!")
+        pushNotification({
+          title: "Duplicates removed",
+          description: `File downloaded: ${filename}`,
+          type: "success",
+        })
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to remove duplicates"
       toast.error(msg)
@@ -308,12 +337,14 @@ export function DuplicatesTool() {
                 )}
 
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1">
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1">
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => setPreviewOpen(true)} className="flex-1">
                     <Eye className="mr-2 h-4 w-4" />
                     Preview Full Data

@@ -17,9 +17,10 @@ import { useAppStore } from "@/lib/store"
 import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface ConvertResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  sheets: string[]
+  sheets?: string[]
 }
 
 export function ConvertTool() {
@@ -84,13 +85,36 @@ export function ConvertTool() {
       })
 
       setProgress(80)
-      const data = await response.json()
 
-      if (!response.ok) throw new Error(data.error || "Conversion failed")
-
-      setProgress(100)
-      setResult(data)
-      toast.success("File converted successfully!")
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Conversion failed")
+        setProgress(100)
+        setResult(data)
+        toast.success("File converted successfully!")
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : `converted.${targetFormat}`;
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("File converted successfully!")
+      }
       pushNotification({
         title: "Conversion complete",
         description: `${file.name} → ${targetFormat.toUpperCase()}`,
@@ -238,14 +262,16 @@ export function ConvertTool() {
                   <p className="text-sm font-medium truncate">{result.filename}</p>
                 </div>
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1">
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1">
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => setPreviewOpen(true)} className="flex-1">
-                    <Eye className="mr-2 h-4 w-4" />
+                    <Eye className="h-4 w-4" />
                     Preview Data
                   </Button>
                 </div>

@@ -27,17 +27,18 @@ interface ChangePreview {
 }
 
 interface ReplaceResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  totalRows: number
-  scopedColumns: string[]
-  matchMode: string
-  caseSensitive: boolean
-  totalMatches: number
-  cellsChanged: number
-  rowsAffected: number
-  changes: ChangePreview[]
-  preview: Record<string, unknown>[]
+  totalRows?: number
+  scopedColumns?: string[]
+  matchMode?: string
+  caseSensitive?: boolean
+  totalMatches?: number
+  cellsChanged?: number
+  rowsAffected?: number
+  changes?: ChangePreview[]
+  preview?: Record<string, unknown>[]
 }
 
 type MatchMode = "contains" | "exact" | "startsWith" | "endsWith"
@@ -128,18 +129,48 @@ export function ReplaceTool() {
       setProgress(50)
       const response = await apiFetch("/api/tools/replace", { method: "POST", body: formData })
       setProgress(80)
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || "Failed to perform find & replace")
-      setProgress(100)
-      setResult(data)
-      toast.success(
-        `Replaced ${data.totalMatches} match${data.totalMatches === 1 ? "" : "es"} across ${data.cellsChanged} cell${data.cellsChanged === 1 ? "" : "s"}`
-      )
-      pushNotification({
-        title: "Find & Replace complete",
-        description: `${data.totalMatches} matches in ${data.cellsChanged} cells (${data.rowsAffected} rows)`,
-        type: data.totalMatches > 0 ? "success" : "info",
-      })
+
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Failed to perform find & replace")
+        setProgress(100)
+        setResult(data)
+        toast.success(
+          `Replaced ${data.totalMatches} match${data.totalMatches === 1 ? "" : "es"} across ${data.cellsChanged} cell${data.cellsChanged === 1 ? "" : "s"}`
+        )
+        pushNotification({
+          title: "Find & Replace complete",
+          description: `${data.totalMatches} matches in ${data.cellsChanged} cells (${data.rowsAffected} rows)`,
+          type: data.totalMatches > 0 ? "success" : "info",
+        })
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "replaced_data.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename })
+        toast.success("Find & Replace completed and file downloaded!")
+        pushNotification({
+          title: "Find & Replace complete",
+          description: `File downloaded: ${filename}`,
+          type: "success",
+        })
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to perform find & replace"
       toast.error(msg)
@@ -352,19 +383,19 @@ export function ReplaceTool() {
                 <div className="grid gap-2 sm:grid-cols-4">
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Total Matches</p>
-                    <p className="text-lg font-semibold text-fuchsia-500">{result.totalMatches}</p>
+                    <p className="text-lg font-semibold text-fuchsia-500">{result.totalMatches || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Cells Changed</p>
-                    <p className="text-lg font-semibold">{result.cellsChanged}</p>
+                    <p className="text-lg font-semibold">{result.cellsChanged || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Rows Affected</p>
-                    <p className="text-lg font-semibold">{result.rowsAffected}</p>
+                    <p className="text-lg font-semibold">{result.rowsAffected || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Total Rows</p>
-                    <p className="text-lg font-semibold">{result.totalRows}</p>
+                    <p className="text-lg font-semibold">{result.totalRows || 0}</p>
                   </div>
                 </div>
 
@@ -376,15 +407,15 @@ export function ReplaceTool() {
                     Case: {caseSensitive ? "sensitive" : "insensitive"}
                   </Badge>
                   <Badge variant="secondary" className="text-[10px]">
-                    Scope: {result.scopedColumns.length === columns.length ? "all columns" : `${result.scopedColumns.length} columns`}
+                    Scope: {(result.scopedColumns?.length || 0) === columns.length ? "all columns" : `${result.scopedColumns?.length || 0} columns`}
                   </Badge>
                 </div>
 
                 {/* Change preview list */}
-                {result.changes.length > 0 && (
+                {result.changes && result.changes.length > 0 && (
                   <div className="space-y-2">
                     <Label className="text-xs text-muted-foreground">
-                      Change Preview ({result.changes.length}{result.totalMatches > 50 ? " of first 50" : ""} shown)
+                      Change Preview ({result.changes.length}{(result.totalMatches || 0) > 50 ? " of first 50" : ""} shown)
                     </Label>
                     <div className="max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-border/50">
                       <table className="w-full text-xs">
@@ -418,12 +449,14 @@ export function ReplaceTool() {
                 )}
 
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1" disabled={result.totalMatches === 0}>
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1" disabled={(result.totalMatches || 0) === 0}>
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                 </div>
               </CardContent>
             </Card>

@@ -71,8 +71,8 @@ export function saveRowsToBuffer(
 ): { buffer: ArrayBuffer; mime: string; extension: string } {
   if (outputFormat === 'csv') {
     const text = Papa.unparse(rows, { delimiter });
-    const buffer = new TextEncoder().encode(text).buffer;
-    return { buffer, mime: 'text/csv', extension: 'csv' };
+    const encoded = new TextEncoder().encode(text);
+    return { buffer: encoded.buffer as ArrayBuffer, mime: 'text/csv', extension: 'csv' };
   }
 
   const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{}]);

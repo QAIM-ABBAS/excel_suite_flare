@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { Database } from '../lib/db';
-import { R2Storage } from '../lib/r2';
 import {
   readBufferToRows,
   saveRowsToBuffer,
@@ -21,12 +20,19 @@ import {
 
 type Bindings = {
   DB: D1Database;
-  R2: R2Bucket;
 };
 
 export const toolsRouter = new Hono<{ Bindings: Bindings }>();
 
-// Helper to generate unique filename
+// In-memory file storage (keyed by temporary ID)
+const fileStore = new Map<string, { buffer: ArrayBuffer; name: string; type: string }>();
+
+// Helper to generate unique ID
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+// Helper to generate download filename
 function generateFilename(baseName: string, extension: string): string {
   const uid = Math.random().toString(36).slice(2, 10);
   return `${sanitizeFilename(baseName)}_${uid}.${extension}`;
@@ -36,7 +42,6 @@ function generateFilename(baseName: string, extension: string): string {
 toolsRouter.post('/:tool', async (c) => {
   const toolName = c.req.param('tool');
   const db = new Database(c.env.DB);
-  const r2 = new R2Storage(c.env.R2);
 
   try {
     const contentType = c.req.header('content-type') || '';
@@ -46,19 +51,25 @@ toolsRouter.post('/:tool', async (c) => {
       const formData = await c.req.formData();
       
       for (const [key, value] of formData.entries()) {
-        if (value instanceof File) {
-          const buffer = await value.arrayBuffer();
-          const filename = generateFilename(value.name.split('.')[0], value.name.split('.').pop() || 'xlsx');
+        // Check if value is a File (has arrayBuffer method)
+        if (typeof value === 'object' && value !== null && 'arrayBuffer' in value) {
+          const file = value as File;
+          const buffer = await file.arrayBuffer();
+          const fileId = generateId();
           
-          // Upload to R2
-          await r2.upload(`uploads/${filename}`, buffer, value.type);
+          // Store in memory temporarily
+          fileStore.set(fileId, {
+            buffer,
+            name: file.name,
+            type: file.type,
+          });
           
           if (key === 'files') {
             if (!args.files) args.files = [];
-            (args.files as string[]).push(`uploads/${filename}`);
+            (args.files as string[]).push(fileId);
           } else if (key === 'file') {
-            args.filepath = `uploads/${filename}`;
-            args.originalName = value.name;
+            args.fileId = fileId;
+            args.originalName = file.name;
           }
         } else {
           let parsedValue: unknown = value;
@@ -68,11 +79,6 @@ toolsRouter.post('/:tool', async (c) => {
           args[key] = parsedValue;
         }
       }
-
-      // Merge tool: ensure files array
-      if (toolName === 'merge' && Array.isArray(args.files) && args.files.length >= 2) {
-        // files array is already set
-      }
     } else if (contentType.includes('application/json')) {
       const body = await c.req.json();
       args = { ...body };
@@ -80,7 +86,13 @@ toolsRouter.post('/:tool', async (c) => {
       return c.json({ error: 'Unsupported content type' }, 400);
     }
 
-    const result = await dispatchTool(toolName, args, r2, db);
+    const result = await dispatchTool(toolName, args, db);
+    
+    // If result is a Response (file download), return it directly
+    if (result instanceof Response) {
+      return result;
+    }
+    
     return c.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -90,44 +102,13 @@ toolsRouter.post('/:tool', async (c) => {
   }
 });
 
-// GET handler
+// GET handler for history and errors
 toolsRouter.get('/:tool', async (c) => {
   const toolName = c.req.param('tool');
   const db = new Database(c.env.DB);
-  const r2 = new R2Storage(c.env.R2);
-  const url = new URL(c.req.url);
 
   try {
-    if (toolName === 'download') {
-      const filename = url.searchParams.get('file');
-      if (!filename) {
-        return c.json({ error: 'Filename is required' }, 400);
-      }
-      
-      const safeName = filename.split('/').pop() || filename;
-      const file = await r2.download(`processed/${safeName}`);
-      
-      if (!file) {
-        return c.json({ error: 'File not found' }, 404);
-      }
-
-      const ext = safeName.split('.').pop()?.toLowerCase() || '';
-      let contentType = 'application/octet-stream';
-      if (ext === 'xlsx') {
-        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      } else if (ext === 'csv') {
-        contentType = 'text/csv';
-      } else if (ext === 'html') {
-        contentType = 'text/html';
-      }
-
-      return new Response(file.body, {
-        headers: {
-          'Content-Type': contentType,
-          'Content-Disposition': `attachment; filename="${safeName}"`,
-        },
-      });
-    } else if (toolName === 'history') {
+    if (toolName === 'history') {
       const records = await db.getHistory();
       return c.json({ success: true, records });
     } else if (toolName === 'errors') {
@@ -174,66 +155,86 @@ toolsRouter.delete('/:tool', async (c) => {
 async function dispatchTool(
   tool: string,
   args: Record<string, unknown>,
-  r2: R2Storage,
   db: Database
 ): Promise<unknown> {
   switch (tool) {
     case 'merge':
-      return toolMerge(args, r2, db);
+      return toolMerge(args, db);
     case 'columns':
-      return toolColumns(args, r2);
+      return toolColumns(args);
     case 'duplicates':
-      return toolDuplicates(args, r2, db);
+      return toolDuplicates(args, db);
     case 'convert':
-      return toolConvert(args, r2, db);
+      return toolConvert(args, db);
     case 'stats':
-      return toolStats(args, r2, db);
+      return toolStats(args, db);
     case 'sort':
-      return toolSort(args, r2, db);
+      return toolSort(args, db);
     case 'filter':
-      return toolFilter(args, r2, db);
+      return toolFilter(args, db);
     case 'replace':
-      return toolReplace(args, r2, db);
+      return toolReplace(args, db);
     case 'transpose':
-      return toolTranspose(args, r2, db);
+      return toolTranspose(args, db);
     case 'pivot':
-      return toolPivot(args, r2, db);
+      return toolPivot(args, db);
     case 'validate':
-      return toolValidate(args, r2, db);
+      return toolValidate(args, db);
     case 'attendance':
-      return toolAttendance(args, r2);
-    case 'preview':
-      return toolPreview(args, r2);
-    case 'download-excel':
-      return toolDownloadExcel(args, r2, db);
-    case 'download-images':
-      return toolDownloadImages(args, r2, db);
+      return toolAttendance(args);
     default:
       return { error: `Unknown tool: ${tool}` };
   }
 }
 
-// Tool implementations
+// Helper to get file buffer from store
+function getFileBuffer(fileId: string): ArrayBuffer | null {
+  const file = fileStore.get(fileId);
+  if (!file) return null;
+  // Clean up after use
+  fileStore.delete(fileId);
+  return file.buffer;
+}
 
+// Helper to get multiple file buffers
+function getFileBuffers(fileIds: string[]): ArrayBuffer[] {
+  const buffers: ArrayBuffer[] = [];
+  for (const id of fileIds) {
+    const buf = getFileBuffer(id);
+    if (buf) buffers.push(buf);
+  }
+  return buffers;
+}
+
+// Helper to create download response
+function createDownloadResponse(buffer: ArrayBuffer, filename: string, mime: string): Response {
+  return new Response(buffer, {
+    headers: {
+      'Content-Type': mime,
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    },
+  });
+}
+
+// ─── Tool: merge ─────────────────────────────────────────────────────────────
 async function toolMerge(
   args: { files?: string[]; outputFormat?: string; outputFilename?: string; originalName?: string },
-  r2: R2Storage,
   db: Database
 ) {
-  const files = args.files || [];
+  const fileIds = args.files || [];
   const outputFormat = (args.outputFormat as 'xlsx' | 'csv') || 'xlsx';
   const outputFilename = args.outputFilename || 'merged';
 
-  if (files.length < 2) return { error: 'At least 2 files are required' };
+  if (fileIds.length < 2) return { error: 'At least 2 files are required' };
+
+  const buffers = getFileBuffers(fileIds);
+  if (buffers.length < 2) return { error: 'Could not read all files' };
 
   const allSheets: Sheet[] = [];
   const allHeaders: string[][] = [];
 
-  for (const f of files) {
-    const file = await r2.download(f);
-    if (!file) continue;
-    const buffer = await file.arrayBuffer();
-    const sheets = readBufferToRows(buffer, f);
+  for (let i = 0; i < buffers.length; i++) {
+    const sheets = readBufferToRows(buffers[i], `file${i}.xlsx`);
     if (sheets.length > 0 && sheets[0].rows.length > 0) {
       allHeaders.push(sheets[0].columns);
       allSheets.push(sheets[0]);
@@ -260,31 +261,22 @@ async function toolMerge(
 
   const { buffer, mime, extension } = saveRowsToBuffer(mergedRows, outputFormat);
   const filename = generateFilename(outputFilename, extension);
-  await r2.upload(`processed/${filename}`, buffer, mime);
-  await db.recordFile(filename, `${outputFilename}.${extension}`, mime, buffer.byteLength, 'merge', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    totalRows: mergedRows.length,
-    headers: allCols,
-    hasMismatch,
-    mismatchWarning: hasMismatch
-      ? 'Some files have different headers. Data was merged using all available columns.'
-      : null,
-  };
+  // Record in history
+  await db.recordFile(filename, `${outputFilename}.${extension}`, mime, buffer.byteLength, 'merge', '');
+
+  return createDownloadResponse(buffer, filename, mime);
 }
 
-async function toolColumns(args: { filepath?: string; originalName?: string }, r2: R2Storage) {
-  const filepath = args.filepath;
-  if (!filepath) return { error: 'File path is required' };
+// ─── Tool: columns ───────────────────────────────────────────────────────────
+async function toolColumns(args: { fileId?: string; originalName?: string }) {
+  const fileId = args.fileId;
+  if (!fileId) return { error: 'File is required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   const result = sheets.map((s) => ({
     name: s.name,
     columns: s.columns,
@@ -294,20 +286,19 @@ async function toolColumns(args: { filepath?: string; originalName?: string }, r
   return { success: true, sheets: result, preview };
 }
 
+// ─── Tool: duplicates ────────────────────────────────────────────────────────
 async function toolDuplicates(
-  args: { filepath?: string; column?: string; keepOccurrence?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; column?: string; keepOccurrence?: string; originalName?: string },
   db: Database
 ) {
-  const { filepath, column } = args;
+  const { fileId, column } = args;
   const keep = args.keepOccurrence === 'last' ? 'last' : 'first';
-  if (!filepath || !column) return { error: 'File and column are required' };
+  if (!fileId || !column) return { error: 'File and column are required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
   const sheet = sheets[0];
@@ -333,41 +324,29 @@ async function toolDuplicates(
     }
   }
 
-  const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
   const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(remainingRows);
+  const baseName = args.originalName?.split('.')[0] || 'output';
   const filename = generateFilename(`${baseName}_cleaned`, extension);
-  await r2.upload(`processed/${filename}`, outBuffer, mime);
-  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'duplicates', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    totalRows: sheet.rows.length,
-    duplicateRows: deletedRows.length,
-    remainingRows: remainingRows.length,
-    preview: {
-      deleted: rowsToDicts(deletedRows.slice(0, 10)),
-      remaining: rowsToDicts(remainingRows.slice(0, 5)),
-    },
-  };
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'duplicates', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
 }
 
+// ─── Tool: convert ───────────────────────────────────────────────────────────
 async function toolConvert(
-  args: { filepath?: string; targetFormat?: string; delimiter?: string; sheetName?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; targetFormat?: string; delimiter?: string; sheetName?: string; originalName?: string },
   db: Database
 ) {
-  const filepath = args.filepath;
+  const fileId = args.fileId;
   const targetFormat = (args.targetFormat as 'xlsx' | 'csv') || 'xlsx';
   const delimiter = args.delimiter || ',';
-  if (!filepath) return { error: 'File is required' };
+  if (!fileId) return { error: 'File is required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath, delimiter);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx', delimiter);
   if (sheets.length === 0) return { error: 'File has no sheets' };
 
   const sheetNames = sheets.map((s) => s.name);
@@ -378,38 +357,32 @@ async function toolConvert(
     targetSheet = sheets[0];
   }
 
-  const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
   const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(targetSheet.rows, targetFormat, delimiter);
+  const baseName = args.originalName?.split('.')[0] || 'output';
   const filename = generateFilename(baseName, extension);
-  await r2.upload(`processed/${filename}`, outBuffer, mime);
-  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'convert', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    sheets: sheetNames,
-  };
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'convert', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
 }
 
+// ─── Tool: stats ─────────────────────────────────────────────────────────────
 async function toolStats(
-  args: { filepath?: string; generateReport?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; generateReport?: string; originalName?: string },
   db: Database
 ) {
-  const filepath = args.filepath;
+  const fileId = args.fileId;
   const generateReport = args.generateReport === 'true';
-  if (!filepath) return { error: 'File is required' };
+  if (!fileId) return { error: 'File is required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
   const sheet = sheets[0];
-  const stats = [];
+  const stats: Record<string, unknown>[] = [];
   
   for (const col of sheet.columns) {
     const values = sheet.rows.map((r) => r[col]);
@@ -450,11 +423,7 @@ async function toolStats(
     stats.push(stat);
   }
 
-  let downloadUrl: string | null = null;
-  let reportFilename: string | null = null;
-  
   if (generateReport) {
-    const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
     const summaryRows: Row[] = stats.map((s) => ({
       Column: String(s.column),
       Type: String(s.type),
@@ -479,20 +448,21 @@ async function toolStats(
           Column: String(s.column),
           Value: tv.value,
           Count: String(tv.count),
-          'Percent of Filled': s.count > 0 ? `${((tv.count / Number(s.count)) * 100).toFixed(1)}%` : '0.0%',
+          'Percent of Filled': Number(s.count) > 0 ? `${((tv.count / Number(s.count)) * 100).toFixed(1)}%` : '0.0%',
         });
       }
     }
     
-    const { buffer: outBuffer, mime, extension } = saveSheetsToFile([
+    const { buffer: outBuffer, mime, extension } = saveSheetsToBuffer([
       { name: 'Summary', rows: summaryRows },
       { name: 'Top Values', rows: topRows },
     ]);
     
-    reportFilename = generateFilename(`${baseName}_stats`, extension);
-    await r2.upload(`processed/${reportFilename}`, outBuffer, mime);
-    await db.recordFile(reportFilename, args.originalName || '', mime, outBuffer.byteLength, 'stats', `processed/${reportFilename}`);
-    downloadUrl = `/api/tools/download?file=${reportFilename}`;
+    const baseName = args.originalName?.split('.')[0] || 'output';
+    const filename = generateFilename(`${baseName}_stats`, extension);
+    await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'stats', '');
+
+    return createDownloadResponse(outBuffer, filename, mime);
   }
 
   return {
@@ -500,25 +470,22 @@ async function toolStats(
     totalRows: sheet.rows.length,
     totalColumns: sheet.columns.length,
     stats,
-    downloadUrl,
-    filename: reportFilename,
   };
 }
 
+// ─── Tool: sort ──────────────────────────────────────────────────────────────
 async function toolSort(
-  args: { filepath?: string; column?: string; order?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; column?: string; order?: string; originalName?: string },
   db: Database
 ) {
-  const { filepath, column } = args;
+  const { fileId, column } = args;
   const order = args.order === 'desc' ? 'desc' : 'asc';
-  if (!filepath || !column) return { error: 'File and column are required' };
+  if (!fileId || !column) return { error: 'File and column are required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
   const sheet = sheets[0];
@@ -541,42 +508,30 @@ async function toolSort(
     return ascending ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
   });
 
-  const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
   const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(rows);
+  const baseName = args.originalName?.split('.')[0] || 'output';
   const filename = generateFilename(`${baseName}_sorted`, extension);
-  await r2.upload(`processed/${filename}`, outBuffer, mime);
-  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'sort', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    totalRows: rows.length,
-    sortedBy: column,
-    order,
-    preview: rowsToDicts(rows.slice(0, 10)),
-  };
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'sort', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
 }
 
-// ... (remaining tool implementations follow the same pattern)
-// For brevity, I'll add the most commonly used ones
-
+// ─── Tool: filter ────────────────────────────────────────────────────────────
 async function toolFilter(
-  args: { filepath?: string; conditions?: Array<{column: string; operator: string; value?: string}>; combineWith?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; conditions?: Array<{column: string; operator: string; value?: string}>; combineWith?: string; originalName?: string },
   db: Database
 ) {
-  const filepath = args.filepath;
+  const fileId = args.fileId;
   const conditions = args.conditions || [];
   const combineWith = args.combineWith === 'OR' ? 'OR' : 'AND';
-  if (!filepath) return { error: 'File is required' };
+  if (!fileId) return { error: 'File is required' };
   if (conditions.length === 0) return { error: 'At least one filter condition is required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
   const sheet = sheets[0];
@@ -611,45 +566,34 @@ async function toolFilter(
       : conditions.every((c) => applyCond(r, c)),
   );
 
-  const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
   const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(filtered);
+  const baseName = args.originalName?.split('.')[0] || 'output';
   const filename = generateFilename(`${baseName}_filtered`, extension);
-  await r2.upload(`processed/${filename}`, outBuffer, mime);
-  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'filter', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    totalRows: sheet.rows.length,
-    matchedRows: filtered.length,
-    removedRows: sheet.rows.length - filtered.length,
-    conditions,
-    combineWith,
-    preview: rowsToDicts(filtered.slice(0, 10)),
-  };
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'filter', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
 }
 
+// ─── Tool: replace ───────────────────────────────────────────────────────────
 async function toolReplace(
-  args: { filepath?: string; find?: string; replace?: string; columns?: string[]; matchMode?: string; caseSensitive?: string; useRegex?: string; originalName?: string },
-  r2: R2Storage,
+  args: { fileId?: string; find?: string; replace?: string; columns?: string[]; matchMode?: string; caseSensitive?: string; useRegex?: string; originalName?: string },
   db: Database
 ) {
-  const filepath = args.filepath;
+  const fileId = args.fileId;
   const find = args.find || '';
   const replace = args.replace ?? '';
   const scopeColumns = args.columns || [];
   const matchMode = args.matchMode || 'contains';
   const caseSensitive = args.caseSensitive === 'true';
   const useRegex = args.useRegex === 'true';
-  if (!filepath) return { error: 'File is required' };
+  if (!fileId) return { error: 'File is required' };
   if (!find) return { error: 'Find text is required' };
 
-  const file = await r2.download(filepath);
-  if (!file) return { error: 'File not found' };
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filepath);
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
   if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
   const sheet = sheets[0];
@@ -704,96 +648,466 @@ async function toolReplace(
     }
   }
 
-  const baseName = filepath.split('/').pop()?.split('.')[0] || 'output';
   const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(rows);
+  const baseName = args.originalName?.split('.')[0] || 'output';
   const filename = generateFilename(`${baseName}_replaced`, extension);
-  await r2.upload(`processed/${filename}`, outBuffer, mime);
-  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'replace', `processed/${filename}`);
 
-  return {
-    success: true,
-    downloadUrl: `/api/tools/download?file=${filename}`,
-    filename,
-    totalRows: rows.length,
-    scopedColumns: finalCols,
-    matchMode: useRegex ? 'regex' : matchMode,
-    caseSensitive,
-    totalMatches,
-    cellsChanged,
-    rowsAffected: rowsAffected.size,
-    changes,
-    preview: rowsToDicts(rows.slice(0, 10)),
-  };
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'replace', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
 }
 
-// Additional tool implementations would follow the same pattern
-// For now, let's add stubs for the remaining tools
+// ─── Tool: transpose ─────────────────────────────────────────────────────────
+async function toolTranspose(
+  args: { fileId?: string; mode?: string; idColumns?: string[]; varName?: string; valueName?: string; originalName?: string },
+  db: Database
+) {
+  const fileId = args.fileId;
+  const mode = args.mode === 'unpivot' ? 'unpivot' : 'transpose';
+  const idColumns = args.idColumns || [];
+  const varName = args.varName || 'variable';
+  const valueName = args.valueName || 'value';
+  if (!fileId) return { error: 'File is required' };
 
-async function toolTranspose(args: Record<string, unknown>, r2: R2Storage, db: Database) {
-  // Implementation similar to original but using R2
-  return { error: 'Not implemented yet' };
-}
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
 
-async function toolPivot(args: Record<string, unknown>, r2: R2Storage, db: Database) {
-  return { error: 'Not implemented yet' };
-}
-
-async function toolValidate(args: Record<string, unknown>, r2: R2Storage, db: Database) {
-  return { error: 'Not implemented yet' };
-}
-
-async function toolAttendance(args: Record<string, unknown>, r2: R2Storage) {
-  return { error: 'Not implemented yet' };
-}
-
-async function toolPreview(args: { file?: string; rows?: number }, r2: R2Storage) {
-  const filename = args.file || '';
-  const rows = args.rows || 50;
-  if (!filename) return { error: 'Filename is required' };
-
-  const file = await r2.download(`processed/${filename}`);
-  if (!file) return { error: 'File not found' };
-
-  const buffer = await file.arrayBuffer();
-  const sheets = readBufferToRows(buffer, filename);
-  const sheet = sheets[0] || { name: 'Sheet1', columns: [], rows: [] };
-  return {
-    success: true,
-    sheetName: sheet.name,
-    totalRows: sheet.rows.length,
-    columns: sheet.columns,
-    data: rowsToDicts(sheet.rows.slice(0, rows)),
-  };
-}
-
-async function toolDownloadExcel(args: { url?: string; originalName?: string }, r2: R2Storage, db: Database) {
-  const url = args.url || '';
-  if (!url) return { error: 'URL is required' };
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
+  if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
   
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return { error: `HTTP ${resp.status}: ${resp.statusText}` };
-    const buf = await resp.arrayBuffer();
-    
-    const urlFilename = decodeURIComponent(url.split('?')[0].split('/').pop() || 'downloaded');
-    const ext = urlFilename.split('.').pop() || 'xlsx';
-    const stem = urlFilename.split('.').slice(0, -1).join('.') || 'downloaded';
-    const filename = generateFilename(stem, ext);
-    
-    await r2.upload(`processed/${filename}`, buf, 'application/octet-stream');
-    await db.recordFile(filename, urlFilename, 'application/octet-stream', buf.byteLength, 'download-excel', `processed/${filename}`);
-    
+  const sheet = sheets[0];
+  const columns = sheet.columns;
+
+  let resultRows: Row[] = [];
+  let outputColumns: string[] = [];
+
+  if (mode === 'transpose') {
+    const newCols = ['Column', ...sheet.rows.map((_, i) => `Row ${i + 1}`)];
+    outputColumns = newCols;
+    for (const col of columns) {
+      const row: Row = { Column: col };
+      for (let i = 0; i < sheet.rows.length; i++) {
+        row[`Row ${i + 1}`] = String(sheet.rows[i][col] ?? '');
+      }
+      resultRows.push(row);
+    }
+  } else {
+    if (idColumns.length === 0) return { error: 'Select at least one ID column for unpivot' };
+    const valueCols = columns.filter((c) => !idColumns.includes(c));
+    if (valueCols.length === 0) return { error: 'No value columns to unpivot' };
+    outputColumns = [...idColumns, varName, valueName];
+    for (const r of sheet.rows) {
+      for (const vc of valueCols) {
+        const out: Row = {};
+        for (const idc of idColumns) out[idc] = r[idc] ?? '';
+        out[varName] = vc;
+        out[valueName] = String(r[vc] ?? '');
+        resultRows.push(out);
+      }
+    }
+  }
+
+  const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(resultRows);
+  const baseName = args.originalName?.split('.')[0] || 'output';
+  const suffix = mode === 'transpose' ? 'transposed' : 'unpivoted';
+  const filename = generateFilename(`${baseName}_${suffix}`, extension);
+
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'transpose', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
+}
+
+// ─── Tool: pivot ─────────────────────────────────────────────────────────────
+async function toolPivot(
+  args: { fileId?: string; groupBy?: string[]; aggregations?: Array<{column: string; function: string; alias?: string}>; originalName?: string },
+  db: Database
+) {
+  const fileId = args.fileId;
+  const groupBy = args.groupBy || [];
+  const aggregations = args.aggregations || [];
+  if (!fileId) return { error: 'File is required' };
+  if (groupBy.length === 0) return { error: 'Select at least one column to group by' };
+  if (aggregations.length === 0) return { error: 'Add at least one aggregation' };
+
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
+
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
+  if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
+  
+  const sheet = sheets[0];
+
+  for (const c of groupBy) {
+    if (!sheet.columns.includes(c)) return { error: `Group-by column '${c}' not found` };
+  }
+  for (const a of aggregations) {
+    if (a.function !== 'count' && !sheet.columns.includes(a.column))
+      return { error: `Aggregation column '${a.column}' not found` };
+  }
+
+  // Group rows by composite key
+  const groups = new Map<string, Row[]>();
+  const groupKeyOrder: string[] = [];
+  for (const r of sheet.rows) {
+    const key = groupBy.map((c) => String(r[c] ?? '')).join('\u0000');
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      groupKeyOrder.push(key);
+    }
+    groups.get(key)!.push(r);
+  }
+
+  const aggFns: Record<string, (vals: number[]) => number> = {
+    sum: (v) => v.reduce((a, b) => a + b, 0),
+    avg: (v) => (v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0),
+    count: (v) => v.length,
+    min: (v) => (v.length ? Math.min(...v) : 0),
+    max: (v) => (v.length ? Math.max(...v) : 0),
+    first: (v) => (v.length ? v[0] : 0),
+    last: (v) => (v.length ? v[v.length - 1] : 0),
+  };
+
+  const resultRows: Row[] = [];
+  for (const key of groupKeyOrder) {
+    const groupRows = groups.get(key)!;
+    const keyParts = key.split('\u0000');
+    const out: Row = {};
+    for (let i = 0; i < groupBy.length; i++) out[groupBy[i]] = keyParts[i];
+    for (const a of aggregations) {
+      const alias = a.alias || `${a.column}_${a.function}`;
+      const fn = aggFns[a.function] || aggFns.count;
+      if (a.function === 'count') {
+        out[alias] = String(fn(groupRows.map(() => 1)));
+      } else if (a.function === 'count_distinct') {
+        const distinctValues = new Set(groupRows.map((r) => String(r[a.column] ?? '')));
+        out[alias] = String(distinctValues.size);
+      } else {
+        const vals = groupRows
+          .map((r) => toNum(r[a.column]))
+          .filter((n) => !Number.isNaN(n));
+        const result = fn(vals);
+        out[alias] = a.function === 'sum' || a.function === 'avg'
+          ? String(round(result))
+          : String(result);
+      }
+    }
+    resultRows.push(out);
+  }
+
+  // Sort by first group-by column
+  const firstCol = groupBy[0];
+  const hasNums = resultRows.some((r) => isNumeric(r[firstCol]));
+  resultRows.sort((a, b) => {
+    if (hasNums) return toNum(a[firstCol]) - toNum(b[firstCol]);
+    return String(a[firstCol]).localeCompare(String(b[firstCol]));
+  });
+
+  const { buffer: outBuffer, mime, extension } = saveRowsToBuffer(resultRows);
+  const baseName = args.originalName?.split('.')[0] || 'output';
+  const filename = generateFilename(`${baseName}_pivot`, extension);
+
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'pivot', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
+}
+
+// ─── Tool: validate ──────────────────────────────────────────────────────────
+async function toolValidate(
+  args: { fileId?: string; checks?: string[]; primaryKey?: string; emailColumns?: string[]; urlColumns?: string[]; dateColumns?: string[]; originalName?: string },
+  db: Database
+) {
+  const fileId = args.fileId;
+  if (!fileId) return { error: 'File is required' };
+
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
+
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
+  if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
+  
+  const sheet = sheets[0];
+
+  const checks = args.checks || [
+    'empty_cells', 'mixed_types', 'duplicate_keys', 'email_format',
+    'url_format', 'date_format', 'constant_columns', 'whitespace',
+    'outliers',
+  ];
+  const primaryKey = args.primaryKey || '';
+  const emailCols = args.emailColumns || [];
+  const urlCols = args.urlColumns || [];
+  const dateCols = args.dateColumns || [];
+
+  const issues: Array<{
+    row: number; column: string; value: string; message: string; severity: string;
+  }> = [];
+  const columnReports: Record<string, unknown>[] = [];
+
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const urlRe = /^(https?:\/\/|www\.)[^\s]+$/i;
+  const dateRe = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?Z?)?$/;
+
+  for (const col of sheet.columns) {
+    const values = sheet.rows.map((r) => r[col]);
+    const nonEmpty = values.filter((v) => v != null && v !== '');
+    const emptyCells = values.length - nonEmpty.length;
+    const whitespaceOnly = values.filter(
+      (v) => typeof v === 'string' && v !== '' && v.trim() === '',
+    ).length;
+    const uniqueSet = new Set(nonEmpty.map((v) => String(v)));
+
+    const nums = nonEmpty.filter((v) => isNumeric(v)).length;
+    const texts = nonEmpty.length - nums;
+    let detectedType: string;
+    if (nonEmpty.length === 0) detectedType = 'empty';
+    else if (nums === nonEmpty.length) detectedType = 'number';
+    else if (texts === nonEmpty.length) detectedType = 'text';
+    else detectedType = 'mixed';
+    const isConstant = nonEmpty.length > 0 && uniqueSet.size === 1;
+
+    const report: Record<string, unknown> = {
+      column: col,
+      totalCells: values.length,
+      emptyCells,
+      whitespaceOnly,
+      uniqueValues: uniqueSet.size,
+      detectedType,
+      isConstant,
+    };
+
+    if (detectedType === 'number' && nonEmpty.length > 0) {
+      const numVals = nonEmpty.map(toNum);
+      report.min = Math.min(...numVals);
+      report.max = Math.max(...numVals);
+      report.mean = round(mean(numVals));
+    } else if (nonEmpty.length > 0) {
+      const strVals = nonEmpty.map(String);
+      report.min = strVals.reduce((a, b) => (a < b ? a : b));
+      report.max = strVals.reduce((a, b) => (a > b ? a : b));
+    }
+    columnReports.push(report);
+
+    if (checks.includes('empty_cells')) {
+      for (let i = 0; i < values.length; i++) {
+        if (values[i] == null || values[i] === '') {
+          issues.push({
+            row: i + 1, column: col, value: '',
+            message: 'Empty cell', severity: 'info',
+          });
+        }
+      }
+    }
+    if (checks.includes('whitespace')) {
+      for (let i = 0; i < values.length; i++) {
+        const v = String(values[i] ?? '');
+        if (v !== '' && v.trim() === '') {
+          issues.push({
+            row: i + 1, column: col, value: v,
+            message: 'Whitespace-only cell', severity: 'warning',
+          });
+        }
+      }
+    }
+    if (checks.includes('constant_columns') && isConstant) {
+      issues.push({
+        row: 0, column: col, value: String(nonEmpty[0]),
+        message: `Column is constant — every non-empty cell is "${nonEmpty[0]}"`,
+        severity: 'info',
+      });
+    }
+    if (checks.includes('outliers') && detectedType === 'number') {
+      const numVals = nonEmpty.map(toNum);
+      const q1 = quantile(numVals, 0.25);
+      const q3 = quantile(numVals, 0.75);
+      const iqr = q3 - q1;
+      if (iqr > 0) {
+        const lower = q1 - 1.5 * iqr;
+        const upper = q3 + 1.5 * iqr;
+        for (let i = 0; i < values.length; i++) {
+          const n = toNum(values[i]);
+          if (!Number.isNaN(n) && (n < lower || n > upper)) {
+            issues.push({
+              row: i + 1, column: col, value: String(values[i]),
+              message: `Outlier detected (${n})`, severity: 'warning',
+            });
+          }
+        }
+      }
+    }
+    if (checks.includes('email_format') && emailCols.includes(col)) {
+      for (let i = 0; i < values.length; i++) {
+        const v = String(values[i] ?? '');
+        if (v && !emailRe.test(v)) {
+          issues.push({
+            row: i + 1, column: col, value: v,
+            message: 'Invalid email format', severity: 'error',
+          });
+        }
+      }
+    }
+    if (checks.includes('url_format') && urlCols.includes(col)) {
+      for (let i = 0; i < values.length; i++) {
+        const v = String(values[i] ?? '');
+        if (v && !urlRe.test(v)) {
+          issues.push({
+            row: i + 1, column: col, value: v,
+            message: 'Invalid URL format', severity: 'error',
+          });
+        }
+      }
+    }
+    if (checks.includes('date_format') && dateCols.includes(col)) {
+      for (let i = 0; i < values.length; i++) {
+        const v = String(values[i] ?? '');
+        if (v && !dateRe.test(v)) {
+          issues.push({
+            row: i + 1, column: col, value: v,
+            message: 'Invalid date format', severity: 'error',
+          });
+        }
+      }
+    }
+  }
+
+  if (checks.includes('duplicate_keys') && primaryKey && sheet.columns.includes(primaryKey)) {
+    const seen = new Map<string, number[]>();
+    for (let i = 0; i < sheet.rows.length; i++) {
+      const v = String(sheet.rows[i][primaryKey] ?? '').trim();
+      if (v === '') continue;
+      if (!seen.has(v)) seen.set(v, []);
+      seen.get(v)!.push(i + 1);
+    }
+    for (const [v, rows] of seen.entries()) {
+      if (rows.length > 1) {
+        issues.push({
+          row: rows[0], column: primaryKey, value: v,
+          message: `Duplicate primary key "${v}" appears in rows: ${rows.join(', ')}`,
+          severity: 'error',
+        });
+      }
+    }
+  }
+
+  const totalCells = sheet.rows.length * sheet.columns.length;
+  const summary = {
+    totalRows: sheet.rows.length,
+    totalColumns: sheet.columns.length,
+    totalCells,
+    emptyCells: columnReports.reduce((a: number, r: Record<string, unknown>) => a + Number(r.emptyCells || 0), 0),
+    uniqueIssues: issues.length,
+    errors: issues.filter((i) => i.severity === 'error').length,
+    warnings: issues.filter((i) => i.severity === 'warning').length,
+    infos: issues.filter((i) => i.severity === 'info').length,
+    constantColumns: columnReports.filter((r: Record<string, unknown>) => r.isConstant).length,
+    mixedTypeColumns: columnReports.filter((r: Record<string, unknown>) => r.detectedType === 'mixed').length,
+  };
+  const overallScore = Math.max(
+    0,
+    Math.round(
+      100 -
+        ((summary.errors * 5 + summary.warnings * 2 + summary.infos * 0.5) /
+          Math.max(1, totalCells)) *
+          100,
+    ),
+  );
+
+  // Generate validation report
+  const summaryRows: Row[] = [
+    ...Object.entries(summary).map(([k, v]) => ({ Metric: k, Value: String(v) })),
+    { Metric: 'Quality Score', Value: `${overallScore}/100` },
+  ];
+  const colData: Row[] = columnReports.map((r: Record<string, unknown>) => ({
+    Column: String(r.column),
+    Type: String(r.detectedType),
+    'Total Cells': String(r.totalCells),
+    'Empty Cells': String(r.emptyCells),
+    'Whitespace-only': String(r.whitespaceOnly),
+    'Unique Values': String(r.uniqueValues),
+    Constant: r.isConstant ? 'Yes' : 'No',
+    Min: r.min != null ? String(r.min) : '',
+    Max: r.max != null ? String(r.max) : '',
+    Mean: r.mean != null ? String(r.mean) : '',
+  }));
+  const issueData: Row[] = issues.slice(0, 1000).map((i) => ({
+    Row: String(i.row),
+    Column: i.column,
+    Value: String(i.value),
+    Severity: i.severity,
+    Message: i.message,
+  }));
+  
+  const { buffer: outBuffer, mime, extension } = saveSheetsToBuffer([
+    { name: 'Summary', rows: summaryRows },
+    { name: 'Columns', rows: colData },
+    { name: 'Issues', rows: issueData },
+  ]);
+  
+  const baseName = args.originalName?.split('.')[0] || 'output';
+  const filename = generateFilename(`${baseName}_validation`, extension);
+  await db.recordFile(filename, args.originalName || '', mime, outBuffer.byteLength, 'validate', '');
+
+  return createDownloadResponse(outBuffer, filename, mime);
+}
+
+// ─── Tool: attendance ────────────────────────────────────────────────────────
+async function toolAttendance(args: {
+  fileId?: string;
+  column?: string;
+  rollNumber?: string;
+  originalName?: string;
+}) {
+  const { fileId, column, rollNumber } = args;
+  if (!fileId || !column || !rollNumber) return { error: 'File, column, and roll number are required' };
+
+  const buffer = getFileBuffer(fileId);
+  if (!buffer) return { error: 'File not found' };
+
+  const sheets = readBufferToRows(buffer, args.originalName || 'file.xlsx');
+  if (sheets.length === 0 || sheets[0].rows.length === 0) return { error: 'File is empty' };
+  
+  const sheet = sheets[0];
+  if (!sheet.columns.includes(column)) return { error: `Column '${column}' not found` };
+
+  const studentRows = sheet.rows.filter(
+    (r) => String(r[column] ?? '').trim() === rollNumber.trim(),
+  );
+  if (studentRows.length === 0) return { error: `No records found for roll number: ${rollNumber}` };
+
+  const classColumns = sheet.columns.filter((c) => c !== column);
+  if (classColumns.length > 0) {
+    const student = studentRows[0];
+    const total = classColumns.length;
+    let present = 0;
+    const details: { class: string; status: string }[] = [];
+    for (const col of classColumns) {
+      const val = String(student[col] ?? '').trim().toLowerCase();
+      const isPresent = ['present', 'p', '1', 'yes', 'true'].includes(val);
+      if (isPresent) present += 1;
+      details.push({ class: col, status: String(student[col] ?? 'N/A') });
+    }
     return {
       success: true,
-      downloadUrl: `/api/tools/download?file=${filename}`,
-      filename,
-      size: buf.byteLength,
+      report: {
+        rollNumber,
+        totalClasses: total,
+        presentCount: present,
+        absentCount: total - present,
+        attendancePercentage: total > 0 ? ((present / total) * 100).toFixed(2) : '0.00',
+        details,
+      },
     };
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : 'Download failed' };
   }
-}
 
-async function toolDownloadImages(args: Record<string, unknown>, r2: R2Storage, db: Database) {
-  return { error: 'Not implemented yet - requires sharp which may not work in Workers' };
+  // No class columns — count rows
+  const totalClasses = sheet.rows.length;
+  const presentCount = studentRows.length;
+  return {
+    success: true,
+    report: {
+      rollNumber,
+      totalClasses,
+      presentCount,
+      absentCount: totalClasses - presentCount,
+      attendancePercentage: totalClasses > 0 ? ((presentCount / totalClasses) * 100).toFixed(2) : '0.00',
+    },
+  };
 }

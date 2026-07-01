@@ -43,11 +43,12 @@ interface ColumnStats {
 }
 
 interface StatsResult {
+  success?: boolean
   downloadUrl?: string
   filename?: string
-  totalRows: number
-  totalColumns: number
-  stats: ColumnStats[]
+  totalRows?: number
+  totalColumns?: number
+  stats?: ColumnStats[]
 }
 
 const typeColor: Record<ColumnStats["type"], string> = {
@@ -114,16 +115,46 @@ export function StatsTool() {
       setProgress(50)
       const response = await apiFetch("/api/tools/stats", { method: "POST", body: formData })
       setProgress(80)
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || "Failed to analyze data")
-      setProgress(100)
-      setResult(data)
-      toast.success(`Analyzed ${data.totalColumns} columns across ${data.totalRows} rows`)
-      pushNotification({
-        title: "Statistics computed",
-        description: `${data.totalRows} rows × ${data.totalColumns} columns analyzed`,
-        type: "success",
-      })
+      
+      // Check if response is a file download (when generateReport is true)
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || "Failed to analyze data")
+        setProgress(100)
+        setResult(data)
+        toast.success(`Analyzed ${data.totalColumns} columns across ${data.totalRows} rows`)
+        pushNotification({
+          title: "Statistics computed",
+          description: `${data.totalRows} rows × ${data.totalColumns} columns analyzed`,
+          type: "success",
+        })
+      } else {
+        // File download response for report
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "stats_report.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename, totalRows: 0, totalColumns: 0, stats: [] })
+        toast.success("Statistics report downloaded!")
+        pushNotification({
+          title: "Statistics computed",
+          description: `Report downloaded: ${filename}`,
+          type: "success",
+        })
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to analyze data"
       toast.error(msg)
@@ -228,16 +259,16 @@ export function StatsTool() {
                 <div className="grid gap-2 sm:grid-cols-3">
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Total Rows</p>
-                    <p className="text-lg font-semibold">{result.totalRows.toLocaleString()}</p>
+                    <p className="text-lg font-semibold">{(result.totalRows || 0).toLocaleString()}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Total Columns</p>
-                    <p className="text-lg font-semibold">{result.totalColumns}</p>
+                    <p className="text-lg font-semibold">{result.totalColumns || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Cells</p>
                     <p className="text-lg font-semibold">
-                      {(result.totalRows * result.totalColumns).toLocaleString()}
+                      {((result.totalRows || 0) * (result.totalColumns || 0)).toLocaleString()}
                     </p>
                   </div>
                 </div>
@@ -246,7 +277,7 @@ export function StatsTool() {
 
             {/* Per-column stat cards */}
             <div className="grid gap-4 md:grid-cols-2">
-              {result.stats.map((s, i) => {
+              {result.stats && result.stats.map((s, i) => {
                 const TypeIcon = typeIcon[s.type] || Minus
                 return (
                   <motion.div

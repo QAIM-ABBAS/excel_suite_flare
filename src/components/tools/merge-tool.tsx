@@ -18,11 +18,12 @@ import { useAppStore } from "@/lib/store"
 import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface MergeResult {
-  downloadUrl: string
+  success?: boolean
+  downloadUrl?: string
   filename: string
-  totalRows: number
-  headers: string[]
-  hasMismatch: boolean
+  totalRows?: number
+  headers?: string[]
+  hasMismatch?: boolean
   mismatchWarning?: string
   preview?: Record<string, unknown>[]
 }
@@ -77,23 +78,41 @@ export function MergeTool() {
 
       setProgress(80)
 
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || "Merge failed")
-      }
-
-      setProgress(100)
-      setResult(data)
-      toast.success(`Merged ${files.length} files successfully! ${data.totalRows} total rows.`)
-      pushNotification({
-        title: "Merge complete",
-        description: `${files.length} files → ${data.totalRows} rows${data.hasMismatch ? " (with header mismatches)" : ""}`,
-        type: data.hasMismatch ? "warning" : "success",
-      })
-
-      if (data.hasMismatch) {
-        toast.warning("Headers differ between files - data was merged using all columns")
+      // Check if response is a file download
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json()
+        if (!response.ok) {
+          throw new Error(data.error || "Merge failed")
+        }
+        setProgress(100)
+        setResult(data)
+        toast.success(`Merged ${files.length} files successfully! ${data.totalRows} total rows.`)
+      } else {
+        // File download response
+        const blob = await response.blob()
+        const contentDisposition = response.headers.get("content-disposition") || "";
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        const filename = filenameMatch ? filenameMatch[1] : "merged_output.xlsx";
+        
+        // Trigger download
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        
+        setProgress(100)
+        setResult({ success: true, filename, totalRows: 0 })
+        toast.success(`Merged ${files.length} files successfully!`)
+        pushNotification({
+          title: "Merge complete",
+          description: `${files.length} files merged → ${filename}`,
+          type: "success",
+        })
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Merge failed"
@@ -243,15 +262,15 @@ export function MergeTool() {
                 <div className="grid gap-2 sm:grid-cols-2">
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Total Rows</p>
-                    <p className="text-lg font-semibold">{result.totalRows}</p>
+                    <p className="text-lg font-semibold">{result.totalRows || 0}</p>
                   </div>
                   <div className="rounded-lg bg-background p-3">
                     <p className="text-xs text-muted-foreground">Columns</p>
-                    <p className="text-lg font-semibold">{result.headers.length}</p>
+                    <p className="text-lg font-semibold">{result.headers?.length || 0}</p>
                   </div>
                 </div>
 
-                {result.headers.length > 0 && (
+                {result.headers && result.headers.length > 0 && (
                   <div className="space-y-2">
                     <Label className="text-xs text-muted-foreground">Merged Columns</Label>
                     <div className="flex flex-wrap gap-1.5">
@@ -265,12 +284,14 @@ export function MergeTool() {
                 )}
 
                 <div className="flex gap-2">
-                  <Button asChild className="flex-1">
-                    <a href={downloadUrl(result.downloadUrl)} download>
-                      <Download className="mr-2 h-4 w-4" />
-                      Download
-                    </a>
-                  </Button>
+                  {result.downloadUrl && (
+                    <Button asChild className="flex-1">
+                      <a href={downloadUrl(result.downloadUrl)} download>
+                        <Download className="mr-2 h-4 w-4" />
+                        Download
+                      </a>
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => setPreviewOpen(true)} className="flex-1">
                     <Eye className="mr-2 h-4 w-4" />
                     Preview Data
