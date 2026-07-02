@@ -12,10 +12,10 @@ import { ImageDown, Download, CheckCircle2, Loader2, AlertTriangle, RotateCcw, I
 import { toast } from "sonner"
 import { motion, AnimatePresence } from "framer-motion"
 import { useAppStore } from "@/lib/store"
-import { apiFetch, downloadUrl } from "@/lib/api"
+import { apiFetch } from "@/lib/api"
 
 interface ImagesResult {
-  downloadUrl: string
+  fileContent: string
   filename: string
   totalRows: number
   successCount: number
@@ -25,7 +25,7 @@ interface ImagesResult {
 
 interface DownloadImagesApiResponse {
   error?: string
-  downloadUrl?: string
+  fileContent?: string
   filename?: string
   totalRows?: number
   successCount?: number
@@ -121,7 +121,7 @@ export function DownloadImagesTool() {
       const failCount = data.failCount ?? Math.max(totalRows - successCount, 0)
 
       const normalizedResult: ImagesResult = {
-        downloadUrl: data.downloadUrl || "",
+        fileContent: data.fileContent || "",
         filename: data.filename || "",
         totalRows,
         successCount,
@@ -399,7 +399,7 @@ export function DownloadImagesTool() {
                 )}
 
                 <Button asChild className="w-full">
-                  <a href={downloadUrl(result.downloadUrl)} download>
+                  <a href={result.fileContent} download={result.filename || "images.html"}>
                     <Download className="mr-2 h-4 w-4" />
                     Download Excel with Images
                   </a>

@@ -102,15 +102,6 @@ toolsRouter.post('/:tool', async (c) => {
   }
 });
 
-// GET handler for downloading generated files
-toolsRouter.get('/download-file/:fileId', (c) => {
-  const fileId = c.req.param('fileId');
-  const file = fileStore.get(fileId);
-  if (!file) return c.json({ error: 'File not found or expired' }, 404);
-  fileStore.delete(fileId);
-  return createDownloadResponse(file.buffer, file.name, file.type);
-});
-
 // GET handler for history and errors
 toolsRouter.get('/:tool', async (c) => {
   const toolName = c.req.param('tool');
@@ -1142,11 +1133,9 @@ async function toolDownloadExcel(args: { url?: string; originalName?: string }, 
 
     await db.recordFile(filename, urlFilename, 'application/octet-stream', buf.byteLength, 'download-excel', '');
 
-    const fileId = generateId();
-    fileStore.set(fileId, { buffer: buf, name: filename, type: 'application/octet-stream' });
-
+    const b64 = Buffer.from(buf).toString('base64');
     return {
-      downloadUrl: `/api/tools/download-file/${fileId}`,
+      fileContent: `data:application/octet-stream;base64,${b64}`,
       filename,
       size: buf.byteLength,
     };
@@ -1453,11 +1442,10 @@ async function toolDownloadImages(args: {
     await db.logError('download-images', `${failCount} of ${sheet.rows.length} images failed`, failedLines);
   }
 
-  const downloadFileId = generateId();
-  fileStore.set(downloadFileId, { buffer: htmlBuffer, name: filename, type: 'text/html' });
+  const b64 = Buffer.from(htmlBuffer).toString('base64');
 
   return {
-    downloadUrl: `/api/tools/download-file/${downloadFileId}`,
+    fileContent: `data:text/html;base64,${b64}`,
     filename,
     totalRows: sheet.rows.length,
     successCount,

@@ -12,10 +12,10 @@ import { Download, Loader2, CheckCircle2, ExternalLink, Eye, Shield, FileSpreads
 import { toast } from "sonner"
 import { motion, AnimatePresence } from "framer-motion"
 import { useAppStore } from "@/lib/store"
-import { apiFetch, downloadUrl } from "@/lib/api"
+import { apiFetch } from "@/lib/api"
 
 interface DownloadResult {
-  downloadUrl: string
+  fileContent: string
   filename: string
   size: number
 }
@@ -198,7 +198,7 @@ export function DownloadExcelTool() {
                 </div>
                 <div className="flex gap-2">
                   <Button asChild className="flex-1">
-                    <a href={downloadUrl(result.downloadUrl)} download>
+                    <a href={result.fileContent} download={result.filename}>
                       <Download className="mr-2 h-4 w-4" />
                       Save to Device
                     </a>
