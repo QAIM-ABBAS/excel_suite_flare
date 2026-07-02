@@ -48,7 +48,6 @@ dev.log
 dev.out.log
 test
 prompt
-.mimocode
 
 server.log
 # Skills directory
@@ -58,3 +57,5 @@ server.log
 dist/
 .vercel/
 node_modules/
+TODO's
+.mimocode
