@@ -1146,6 +1146,8 @@ async function toolDownloadExcel(args: { url?: string; originalName?: string }, 
 
 // ─── Tool: download-images ───────────────────────────────────────────────────
 
+const CONCURRENCY = 6;
+
 function detectImageFormat(buf: ArrayBuffer): {
   ext: string;
   mimeType: string;
@@ -1171,7 +1173,6 @@ function detectImageFormat(buf: ArrayBuffer): {
   )
     return { ext: 'webp', mimeType: 'image/webp', isSupported: true };
 
-  // Unknown — likely HTML error page or corrupted
   return { ext: 'jpeg', mimeType: 'image/jpeg', isSupported: false };
 }
 
@@ -1183,12 +1184,100 @@ function escapeHtml(str: string): string {
     .replace(/"/g, '&quot;');
 }
 
-async function toolDownloadImages(args: {
-  fileId?: string;
-  urlColumn?: string;
-  originalName?: string;
-  selectedColumns?: string[];
-}, db: Database) {
+// Bounded-concurrency runner — avoids blowing through Workers subrequest
+// limits or hammering the target host with 100+ simultaneous fetches.
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+
+  async function runNext(): Promise<void> {
+    while (cursor < items.length) {
+      const current = cursor++;
+      results[current] = await worker(items[current], current);
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length) || 0;
+  const workers = Array.from({ length: workerCount }, () => runNext());
+  await Promise.all(workers);
+  return results;
+}
+
+async function downloadOneImage(
+  url: string,
+  row: number
+): Promise<{ row: number; url: string; status: string; error?: string; buffer: ArrayBuffer | null }> {
+  if (!url) {
+    return { row, url: '', status: 'skipped', buffer: null };
+  }
+
+  let currentUrl = url;
+
+  try {
+    // Try up to 2 times (first try = original URL, second try = extracted URL)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const resp = await fetch(currentUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const buf = await resp.arrayBuffer();
+      const contentType = resp.headers.get('content-type') || '';
+
+      const textStart = new TextDecoder().decode(buf.slice(0, 100)).trimStart();
+      const isHtml =
+        contentType.includes('text/html') ||
+        textStart.startsWith('<!DOCTYPE') ||
+        textStart.startsWith('<html');
+
+      if (isHtml) {
+        if (attempt === 0) {
+          const htmlText = new TextDecoder().decode(buf);
+          const match =
+            htmlText.match(/https?:\/\/[^"'\s]+responses\.storage[^"'\s]+/i) ||
+            htmlText.match(/https?:\/\/[^"'\s]+\.(?:jpeg|jpg|png|webp|gif)[^"'\s]*/i);
+
+          if (match && match[0] && match[0] !== currentUrl) {
+            currentUrl = match[0];
+            continue;
+          }
+        }
+        throw new Error('Server returned HTML page instead of image');
+      }
+
+      if (buf.byteLength === 0) throw new Error('Empty response body');
+
+      return { row, url: currentUrl, status: 'success', buffer: buf };
+    }
+
+    throw new Error('Failed to download image buffer');
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : 'Failed';
+    return { row, url: currentUrl, status: 'failed', error: errMsg, buffer: null };
+  }
+}
+
+async function toolDownloadImages(
+  args: {
+    fileId?: string;
+    urlColumn?: string;
+    originalName?: string;
+    selectedColumns?: string[];
+  },
+  db: Database
+) {
   const { fileId, urlColumn, originalName = 'images', selectedColumns } = args;
 
   if (!fileId) return { error: 'File path is required' };
@@ -1205,110 +1294,43 @@ async function toolDownloadImages(args: {
     return { error: `Column "${urlColumn}" not found in file` };
   }
 
-  // Download all images
+  // Download images with bounded concurrency instead of a sequential for-loop
+  const urls = sheet.rows.map((r) => (r[urlColumn] || '').trim());
+  const downloadResults = await runWithConcurrency(urls, CONCURRENCY, (url, i) =>
+    downloadOneImage(url, i + 1)
+  );
+
+  // Convert successful buffers into inline base64 <img> sources
   const results: { row: number; url: string; status: string; error?: string }[] = [];
-  const imageBuffers: (ArrayBuffer | null)[] = [];
-
-  for (let i = 0; i < sheet.rows.length; i++) {
-    const url = (sheet.rows[i][urlColumn] || '').trim();
-    if (!url) {
-      results.push({ row: i + 1, url: '', status: 'skipped' });
-      imageBuffers.push(null);
-      continue;
-    }
-
-    let currentUrl = url;
-    let finalBuf: ArrayBuffer | null = null;
-
-    try {
-      // Try up to 2 times (first try = original URL, second try = extracted URL)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const resp = await fetch(currentUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-          signal: AbortSignal.timeout(30000),
-        });
-
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-        const buf = await resp.arrayBuffer();
-        const contentType = resp.headers.get('content-type') || '';
-
-        // Check if the response is HTML
-        const textStart = new TextDecoder().decode(buf.slice(0, 100)).trimStart();
-        const isHtml = contentType.includes('text/html') ||
-                       textStart.startsWith('<!DOCTYPE') ||
-                       textStart.startsWith('<html');
-
-        if (isHtml) {
-          if (attempt === 0) {
-            // We got the HTML wrapper. Try to extract the real link from the JavaScript inside.
-            const htmlText = new TextDecoder().decode(buf);
-
-            // Look for URLs pointing to storage, or ending in image extensions
-            const match = htmlText.match(/https?:\/\/[^"'\s]+responses\.storage[^"'\s]+/i) ||
-                          htmlText.match(/https?:\/\/[^"'\s]+\.(?:jpeg|jpg|png|webp|gif)[^"'\s]*/i);
-
-            if (match && match[0] && match[0] !== currentUrl) {
-              currentUrl = match[0]; // Switch to the real link
-              continue; // Loop again to fetch the actual image
-            }
-          }
-          // If we couldn't find a link, or if this was the second attempt, fail.
-          throw new Error('Server returned HTML page instead of image');
-        }
-
-        // If we get here, it's a binary file (success!)
-        if (buf.byteLength === 0) throw new Error('Empty response body');
-
-        finalBuf = buf;
-        break; // Exit the loop, we have the image
-      }
-
-      if (!finalBuf) throw new Error('Failed to download image buffer');
-
-      imageBuffers.push(finalBuf);
-      results.push({ row: i + 1, url: currentUrl, status: 'success' });
-
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : 'Failed';
-      imageBuffers.push(null);
-      results.push({ row: i + 1, url: currentUrl, status: 'failed', error: errMsg });
-    }
-  }
-
-  // Process images into base64 strings
   const imageBase64s: (string | null)[] = [];
 
-  for (let i = 0; i < imageBuffers.length; i++) {
-    const buf = imageBuffers[i];
-    if (!buf) {
+  for (const dr of downloadResults) {
+    if (!dr.buffer) {
+      results.push({ row: dr.row, url: dr.url, status: dr.status, error: dr.error });
       imageBase64s.push(null);
       continue;
     }
 
     try {
-      const { mimeType, isSupported } = detectImageFormat(buf);
+      const { mimeType, isSupported } = detectImageFormat(dr.buffer);
 
-      // Skip completely if not a recognized image format
       if (!isSupported) {
-        results[i].status = 'failed';
-        results[i].error = 'Unrecognized image format (possibly corrupted)';
+        results.push({
+          row: dr.row,
+          url: dr.url,
+          status: 'failed',
+          error: 'Unrecognized image format (possibly corrupted)',
+        });
         imageBase64s.push(null);
         continue;
       }
 
-      // Convert to base64 (no sharp processing in Workers - images kept as-is)
-      const b64 = Buffer.from(buf).toString('base64');
+      const b64 = Buffer.from(dr.buffer).toString('base64');
       imageBase64s.push(`data:${mimeType};base64,${b64}`);
+      results.push({ row: dr.row, url: dr.url, status: 'success' });
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : 'Image processing failed';
-      results[i].status = 'failed';
-      results[i].error = errMsg;
+      results.push({ row: dr.row, url: dr.url, status: 'failed', error: errMsg });
       imageBase64s.push(null);
     }
   }
@@ -1319,10 +1341,7 @@ async function toolDownloadImages(args: {
     otherColumns = otherColumns.filter((c) => selectedColumns.includes(c));
   }
 
-  const headerCells = [
-    '<th>Image</th>',
-    ...otherColumns.map((c) => `<th>${escapeHtml(c)}</th>`),
-  ].join('');
+  const headerCells = ['<th>Image</th>', ...otherColumns.map((c) => `<th>${escapeHtml(c)}</th>`)].join('');
 
   const bodyRows = sheet.rows.map((row, i) => {
     const imgSrc = imageBase64s[i];
@@ -1330,9 +1349,7 @@ async function toolDownloadImages(args: {
       ? `<td class="img-cell"><img src="${imgSrc}" /></td>`
       : `<td class="img-cell empty">${results[i]?.error ? 'Error' : '—'}</td>`;
 
-    const dataCells = otherColumns
-      .map((c) => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`)
-      .join('');
+    const dataCells = otherColumns.map((c) => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`).join('');
 
     return `<tr>${imgCell}${dataCells}</tr>`;
   });
@@ -1426,10 +1443,14 @@ async function toolDownloadImages(args: {
 </body>
 </html>`;
 
-  const htmlBuffer = new TextEncoder().encode(html).buffer as ArrayBuffer;
   const filename = generateFilename('images', 'html');
+  const byteLength = new TextEncoder().encode(html).length;
 
-  await db.recordFile(filename, originalName, 'text/html', htmlBuffer.byteLength, 'download-images', '');
+  try {
+    await db.recordFile(filename, originalName, 'text/html', byteLength, 'download-images', '');
+  } catch (e) {
+    console.error('recordFile failed (non-fatal):', e);
+  }
 
   const successCount = results.filter((r) => r.status === 'success').length;
   const failCount = results.filter((r) => r.status === 'failed').length;
@@ -1439,13 +1460,15 @@ async function toolDownloadImages(args: {
       .filter((r) => r.status === 'failed')
       .map((r) => `Row ${r.row}: ${r.url} — ${r.error || 'unknown'}`)
       .join('\n');
-    await db.logError('download-images', `${failCount} of ${sheet.rows.length} images failed`, failedLines);
+    try {
+      await db.logError('download-images', `${failCount} of ${sheet.rows.length} images failed`, failedLines);
+    } catch (e) {
+      console.error('logError failed (non-fatal):', e);
+    }
   }
 
-  const b64 = Buffer.from(htmlBuffer).toString('base64');
-
   return {
-    fileContent: `data:text/html;base64,${b64}`,
+    fileContent: html,
     filename,
     totalRows: sheet.rows.length,
     successCount,
@@ -1453,3 +1476,5 @@ async function toolDownloadImages(args: {
     results,
   };
 }
+
+export { toolDownloadImages };
