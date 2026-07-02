@@ -20,6 +20,7 @@ import {
 
 type Bindings = {
   DB: D1Database;
+  KV: KVNamespace;
 };
 
 export const toolsRouter = new Hono<{ Bindings: Bindings }>();
@@ -86,7 +87,7 @@ toolsRouter.post('/:tool', async (c) => {
       return c.json({ error: 'Unsupported content type' }, 400);
     }
 
-    const result = await dispatchTool(toolName, args, db);
+    const result = await dispatchTool(toolName, args, db, c.env.KV);
     
     // If result is a Response (file download), return it directly
     if (result instanceof Response) {
@@ -100,6 +101,26 @@ toolsRouter.post('/:tool', async (c) => {
     await db.logError(toolName, message, error instanceof Error ? (error.stack || '') : '');
     return c.json({ error: message }, 500);
   }
+});
+
+// GET handler for downloading generated files from KV
+toolsRouter.get('/download-file/:fileId', async (c) => {
+  const fileId = c.req.param('fileId');
+  const kv = c.env.KV;
+  const stored = await kv.get<{ buffer: string; name: string; type: string }>(fileId, { type: 'json' });
+  if (!stored) return c.json({ error: 'File not found or expired' }, 404);
+
+  // Decode base64 back to ArrayBuffer
+  const binary = atob(stored.buffer);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  return new Response(bytes.buffer, {
+    headers: {
+      'Content-Type': stored.type,
+      'Content-Disposition': `attachment; filename="${stored.name}"`,
+    },
+  });
 });
 
 // GET handler for history and errors
@@ -155,7 +176,8 @@ toolsRouter.delete('/:tool', async (c) => {
 async function dispatchTool(
   tool: string,
   args: Record<string, unknown>,
-  db: Database
+  db: Database,
+  kv: KVNamespace
 ): Promise<unknown> {
   switch (tool) {
     case 'merge':
@@ -183,9 +205,9 @@ async function dispatchTool(
     case 'attendance':
       return toolAttendance(args);
     case 'download-excel':
-      return toolDownloadExcel(args, db);
+      return toolDownloadExcel(args, db, kv);
     case 'download-images':
-      return toolDownloadImages(args, db);
+      return toolDownloadImages(args, db, kv);
     default:
       return { error: `Unknown tool: ${tool}` };
   }
@@ -1117,7 +1139,7 @@ async function toolAttendance(args: {
 }
 
 // ─── Tool: download-excel ────────────────────────────────────────────────────
-async function toolDownloadExcel(args: { url?: string; originalName?: string }, db: Database) {
+async function toolDownloadExcel(args: { url?: string; originalName?: string }, db: Database, kv: KVNamespace) {
   const url = args.url || '';
   if (!url) return { error: 'URL is required' };
 
@@ -1133,9 +1155,14 @@ async function toolDownloadExcel(args: { url?: string; originalName?: string }, 
 
     await db.recordFile(filename, urlFilename, 'application/octet-stream', buf.byteLength, 'download-excel', '');
 
+    const fileId = generateId();
     const b64 = Buffer.from(buf).toString('base64');
+    await kv.put(fileId, JSON.stringify({ buffer: b64, name: filename, type: 'application/octet-stream' }), {
+      expirationTtl: 300,
+    });
+
     return {
-      fileContent: `data:application/octet-stream;base64,${b64}`,
+      downloadUrl: `/api/tools/download-file/${fileId}`,
       filename,
       size: buf.byteLength,
     };
@@ -1276,7 +1303,8 @@ async function toolDownloadImages(
     originalName?: string;
     selectedColumns?: string[];
   },
-  db: Database
+  db: Database,
+  kv: KVNamespace
 ) {
   const { fileId, urlColumn, originalName = 'images', selectedColumns } = args;
 
@@ -1467,8 +1495,14 @@ async function toolDownloadImages(
     }
   }
 
+  const kvFileId = generateId();
+  const b64 = Buffer.from(html).toString('base64');
+  await kv.put(kvFileId, JSON.stringify({ buffer: b64, name: filename, type: 'text/html' }), {
+    expirationTtl: 300, // 5 minutes
+  });
+
   return {
-    fileContent: html,
+    downloadUrl: `/api/tools/download-file/${kvFileId}`,
     filename,
     totalRows: sheet.rows.length,
     successCount,

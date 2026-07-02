@@ -9,6 +9,11 @@ binding = "DB"
 database_name = "excel-suite-db"
 database_id = "0881424a-39a6-470b-93f3-7ec314aa97b2"
 
+# KV namespace for temporary file storage
+[[kv_namespaces]]
+binding = "KV"
+id = "2fe579f8c40a4b52855cf06e4e66c014"
+
 # Environment variables
 [vars]
 ENVIRONMENT = "production"

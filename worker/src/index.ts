@@ -4,6 +4,7 @@ import { toolsRouter } from './routes/tools';
 
 type Bindings = {
   DB: D1Database;
+  KV: KVNamespace;
   ENVIRONMENT: string;
 };
 

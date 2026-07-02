@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState } from "react"
 import { FileDropzone } from "@/components/file-dropzone"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -12,10 +12,10 @@ import { ImageDown, Download, CheckCircle2, Loader2, AlertTriangle, RotateCcw, I
 import { toast } from "sonner"
 import { motion, AnimatePresence } from "framer-motion"
 import { useAppStore } from "@/lib/store"
-import { apiFetch } from "@/lib/api"
+import { apiFetch, downloadUrl } from "@/lib/api"
 
 interface ImagesResult {
-  fileContent: string // raw HTML string now, NOT a data: URI
+  downloadUrl: string
   filename: string
   totalRows: number
   successCount: number
@@ -25,7 +25,7 @@ interface ImagesResult {
 
 interface DownloadImagesApiResponse {
   error?: string
-  fileContent?: string
+  downloadUrl?: string
   filename?: string
   totalRows?: number
   successCount?: number
@@ -47,31 +47,10 @@ export function DownloadImagesTool() {
   const [result, setResult] = useState<ImagesResult | null>(null)
   const [viewMode, setViewMode] = useState<"all" | "success" | "failed">("all")
 
-  // Blob URL for the actual download — built client-side from the raw HTML
-  // string. This replaces the old data:text/html;base64,... href, which
-  // silently failed to trigger a download once the payload got large
-  // (double base64 encoding + long data: URIs are unreliable in browsers).
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
-  const downloadUrlRef = useRef<string | null>(null)
-
-  const revokeCurrentUrl = () => {
-    if (downloadUrlRef.current) {
-      URL.revokeObjectURL(downloadUrlRef.current)
-      downloadUrlRef.current = null
-    }
-  }
-
-  // Clean up the blob URL on unmount
-  useEffect(() => {
-    return () => revokeCurrentUrl()
-  }, [])
-
   const handleFileSelected = async (files: File[]) => {
     const selected = files[0]
     setFile(selected)
     setResult(null)
-    revokeCurrentUrl()
-    setDownloadUrl(null)
     setIsLoadingColumns(true)
 
     try {
@@ -120,7 +99,7 @@ export function DownloadImagesTool() {
 
       // Simulate progress during download
       const progressInterval = setInterval(() => {
-        setProgress((prev) => Math.min(prev + 3, 85))
+        setProgress(prev => Math.min(prev + 3, 85))
       }, 1000)
 
       const response = await apiFetch("/api/tools/download-images", {
@@ -137,30 +116,16 @@ export function DownloadImagesTool() {
 
       const normalizedResults = Array.isArray(data.results) ? data.results : []
       const totalRows = data.totalRows ?? data.totalImages ?? normalizedResults.length
-      const successCount =
-        data.successCount ?? data.successful ?? normalizedResults.filter((r) => r.status === "success").length
+      const successCount = data.successCount ?? data.successful ?? normalizedResults.filter((r) => r.status === "success").length
       const failCount = data.failCount ?? Math.max(totalRows - successCount, 0)
 
       const normalizedResult: ImagesResult = {
-        fileContent: data.fileContent || "",
+        downloadUrl: data.downloadUrl || "",
         filename: data.filename || "",
         totalRows,
         successCount,
         failCount,
         results: normalizedResults,
-      }
-
-      // Build a Blob URL from the raw HTML string instead of relying on
-      // a data: URI. This is the fix for "success toast but no file
-      // appears" — Blob URLs work reliably regardless of payload size.
-      revokeCurrentUrl()
-      if (normalizedResult.fileContent) {
-        const blob = new Blob([normalizedResult.fileContent], { type: "text/html" })
-        const url = URL.createObjectURL(blob)
-        downloadUrlRef.current = url
-        setDownloadUrl(url)
-      } else {
-        setDownloadUrl(null)
       }
 
       setProgress(100)
@@ -191,13 +156,11 @@ export function DownloadImagesTool() {
     setSelectedColumn("")
     setSelectedColumns([])
     setResult(null)
-    revokeCurrentUrl()
-    setDownloadUrl(null)
   }
 
   const resultRows = Array.isArray(result?.results) ? result.results : []
 
-  const filteredResults = resultRows.filter((r) => {
+  const filteredResults = resultRows.filter(r => {
     if (viewMode === "success") return r.status === "success"
     if (viewMode === "failed") return r.status === "failed"
     return true
@@ -244,10 +207,8 @@ export function DownloadImagesTool() {
                     <SelectValue placeholder="Select column containing image URLs" />
                   </SelectTrigger>
                   <SelectContent>
-                    {columns.map((col) => (
-                      <SelectItem key={col} value={col}>
-                        {col}
-                      </SelectItem>
+                    {columns.map(col => (
+                      <SelectItem key={col} value={col}>{col}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -256,31 +217,31 @@ export function DownloadImagesTool() {
               {/* Column scope selection */}
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <Label className="text-xs text-muted-foreground">Columns to Include in Export</Label>
+                  <Label className="text-xs text-muted-foreground">
+                    Columns to Include in Export
+                  </Label>
                   <Badge variant="secondary" className="text-[10px]">
                     {selectedColumns.length === 0 ? "All columns" : `${selectedColumns.length} selected`}
                   </Badge>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {columns
-                    .filter((col) => col !== selectedColumn)
-                    .map((col) => {
-                      const active = selectedColumns.includes(col)
-                      return (
-                        <button
-                          key={col}
-                          type="button"
-                          onClick={() => toggleColumn(col)}
-                          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-all ${
-                            active
-                              ? "border-pink-500/40 bg-pink-500/10 text-pink-600 dark:text-pink-400"
-                              : "border-border/50 bg-muted/30 hover:bg-muted/60"
-                          }`}
-                        >
-                          {col}
-                        </button>
-                      )
-                    })}
+                  {columns.filter(col => col !== selectedColumn).map((col) => {
+                    const active = selectedColumns.includes(col)
+                    return (
+                      <button
+                        key={col}
+                        type="button"
+                        onClick={() => toggleColumn(col)}
+                        className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-all ${
+                          active
+                            ? "border-pink-500/40 bg-pink-500/10 text-pink-600 dark:text-pink-400"
+                            : "border-border/50 bg-muted/30 hover:bg-muted/60"
+                        }`}
+                      >
+                        {col}
+                      </button>
+                    )
+                  })}
                 </div>
                 {selectedColumns.length === 0 && (
                   <p className="text-[10px] text-muted-foreground">
@@ -291,9 +252,7 @@ export function DownloadImagesTool() {
 
               <div className="rounded-lg border border-pink-500/20 bg-pink-500/5 p-3">
                 <p className="text-xs text-pink-600 dark:text-pink-400">
-                  <strong>How it works:</strong> The tool downloads each image URL, embeds the image directly into a
-                  new <strong>Image</strong> column in your spreadsheet, and preserves all original data. Supported
-                  formats: JPG, PNG, GIF, BMP.
+                  <strong>How it works:</strong> The tool downloads each image URL, embeds the image directly into a new <strong>Image</strong> column in your spreadsheet, and preserves all original data. Supported formats: JPG, PNG, GIF, BMP.
                 </p>
               </div>
             </motion.div>
@@ -361,8 +320,7 @@ export function DownloadImagesTool() {
                   <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                     <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 shrink-0" />
                     <p className="text-sm text-amber-600 dark:text-amber-400">
-                      {result.failCount} image(s) failed to download. The corresponding rows have been preserved with
-                      original URLs.
+                      {result.failCount} image(s) failed to download. The corresponding rows have been preserved with original URLs.
                     </p>
                   </div>
                 )}
@@ -382,9 +340,7 @@ export function DownloadImagesTool() {
                       <button
                         onClick={() => setViewMode("success")}
                         className={`flex-1 rounded-md px-3 py-1 text-xs font-medium transition-all ${
-                          viewMode === "success"
-                            ? "bg-background shadow-sm text-emerald-600 dark:text-emerald-400"
-                            : "text-muted-foreground hover:text-foreground"
+                          viewMode === "success" ? "bg-background shadow-sm text-emerald-600 dark:text-emerald-400" : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
                         Success ({result.successCount})
@@ -392,9 +348,7 @@ export function DownloadImagesTool() {
                       <button
                         onClick={() => setViewMode("failed")}
                         className={`flex-1 rounded-md px-3 py-1 text-xs font-medium transition-all ${
-                          viewMode === "failed"
-                            ? "bg-background shadow-sm text-rose-600 dark:text-rose-400"
-                            : "text-muted-foreground hover:text-foreground"
+                          viewMode === "failed" ? "bg-background shadow-sm text-rose-600 dark:text-rose-400" : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
                         Failed ({result.failCount})
@@ -414,9 +368,7 @@ export function DownloadImagesTool() {
                           {filteredResults.slice(0, 50).map((r, i) => (
                             <tr key={i} className={`border-b border-border/30 ${r.status === "failed" ? "bg-rose-500/5" : ""}`}>
                               <td className="px-2 py-1.5 text-muted-foreground tabular-nums">{r.row}</td>
-                              <td className="px-2 py-1.5 truncate max-w-[160px]" title={r.url}>
-                                {r.url}
-                              </td>
+                              <td className="px-2 py-1.5 truncate max-w-[160px]" title={r.url}>{r.url}</td>
                               <td className="px-2 py-1.5 whitespace-nowrap">
                                 {r.status === "success" ? (
                                   <Badge variant="secondary" className="text-[9px] bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
@@ -433,7 +385,9 @@ export function DownloadImagesTool() {
                                 )}
                               </td>
                               <td className="px-2 py-1.5 max-w-[200px]" title={r.error}>
-                                {r.error ? <span className="text-rose-500 dark:text-rose-400 break-all">{r.error}</span> : null}
+                                {r.error ? (
+                                  <span className="text-rose-500 dark:text-rose-400 break-all">{r.error}</span>
+                                ) : null}
                               </td>
                             </tr>
                           ))}
@@ -443,8 +397,8 @@ export function DownloadImagesTool() {
                   </div>
                 )}
 
-                <Button asChild className="w-full" disabled={!downloadUrl}>
-                  <a href={downloadUrl ?? "#"} download={result.filename || "images.html"}>
+                <Button asChild className="w-full">
+                  <a href={downloadUrl(result.downloadUrl)} download>
                     <Download className="mr-2 h-4 w-4" />
                     Download Excel with Images
                   </a>
