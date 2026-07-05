@@ -521,7 +521,7 @@ Work Log:
 - Updated src/components/keyboard-shortcuts-help.tsx: added 2 new shortcut entries to Navigation group
 - Updated src/components/about-view.tsx: added 2 new feature entries, bumped Tools count from 11 → 13, version 2.2.0 → 2.3.0
 - Updated src/components/settings-view.tsx: added validate and transpose to toolLabelMap and toolColorMap so File History records display correctly
-- Updated src/components/app-footer.tsx: bumped version to v2.3.0, improved footer spacing (added dot separators between nav links, made "Shortcuts" text hidden on mobile)
+- Updated src/components/app-footer.tsx: bumped version to v2.3.2, improved footer spacing (added dot separators between nav links, made "Shortcuts" text hidden on mobile)
 
 ## Mandatory Styling Improvements
 - Enhanced FileDropzone component (used by all tools):
@@ -554,8 +554,8 @@ Work Log:
   - Keyboard shortcuts g+v navigates to Validate, g+r navigates to Transpose (verified h1 changes).
   - "?" shortcuts dialog shows new "Go to Data Validation" and "Go to Transpose / Reshape" entries.
   - Settings → File History tab shows records with "Validate" and "Transpose" badges (correct labels and colors).
-  - About page shows "13" tools, v2.3.0, and 2 new feature entries.
-  - Footer shows v2.3.0 with improved spacing.
+  - About page shows "13" tools, v2.3.2, and 2 new feature entries.
+  - Footer shows v2.3.2 with improved spacing.
 - VLM (z-ai vision) verified screenshot quality on dashboard, validate tool (initial + results), transpose tool (initial + results), settings — all rendering correctly with no major issues.
 - curl verified both APIs end-to-end:
   - validate: 6-row dirty file → score 57/100, 1 error + 3 warnings + 4 infos (math correct)
@@ -569,7 +569,7 @@ Stage Summary:
 - FileDropzone enhanced with clear "Browse Files" button affordance (used by all tools).
 - Footer polish with dot separators and responsive hiding.
 - All new tools wired into: sidebar, dashboard, command palette, keyboard shortcuts (g+v, g+r), shortcuts help dialog, settings File History labels, about page.
-- Version bumped to v2.3.0 consistently across about page and footer.
+- Version bumped to v2.3.2 consistently across about page and footer.
 - Lint passes, dev server healthy, all features verified end-to-end via curl + agent-browser + VLM.
 
 ---

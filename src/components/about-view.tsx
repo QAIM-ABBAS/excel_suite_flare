@@ -49,7 +49,7 @@ export function AboutView() {
               <div>
                 <div className="flex items-center gap-2">
                   <CardTitle className="text-xl">Excel Automation Suite</CardTitle>
-                  <Badge variant="secondary" className="text-[10px]">v2.3.0</Badge>
+                  <Badge variant="secondary" className="text-[10px]">v2.3.2</Badge>
                 </div>
                 <p className="text-sm text-muted-foreground mt-0.5">Professional spreadsheet automation tools</p>
               </div>

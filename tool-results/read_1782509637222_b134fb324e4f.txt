@@ -521,7 +521,7 @@
    521→   521→- Updated src/components/keyboard-shortcuts-help.tsx: added 2 new shortcut entries to Navigation group
    522→   522→- Updated src/components/about-view.tsx: added 2 new feature entries, bumped Tools count from 11 → 13, version 2.2.0 → 2.3.0
    523→   523→- Updated src/components/settings-view.tsx: added validate and transpose to toolLabelMap and toolColorMap so File History records display correctly
-   524→   524→- Updated src/components/app-footer.tsx: bumped version to v2.3.0, improved footer spacing (added dot separators between nav links, made "Shortcuts" text hidden on mobile)
+   524→   524→- Updated src/components/app-footer.tsx: bumped version to v2.3.2, improved footer spacing (added dot separators between nav links, made "Shortcuts" text hidden on mobile)
    525→   525→
    526→   526→## Mandatory Styling Improvements
    527→   527→- Enhanced FileDropzone component (used by all tools):
@@ -554,8 +554,8 @@
    554→   554→  - Keyboard shortcuts g+v navigates to Validate, g+r navigates to Transpose (verified h1 changes).
    555→   555→  - "?" shortcuts dialog shows new "Go to Data Validation" and "Go to Transpose / Reshape" entries.
    556→   556→  - Settings → File History tab shows records with "Validate" and "Transpose" badges (correct labels and colors).
-   557→   557→  - About page shows "13" tools, v2.3.0, and 2 new feature entries.
-   558→   558→  - Footer shows v2.3.0 with improved spacing.
+   557→   557→  - About page shows "13" tools, v2.3.2, and 2 new feature entries.
+   558→   558→  - Footer shows v2.3.2 with improved spacing.
    559→   559→- VLM (z-ai vision) verified screenshot quality on dashboard, validate tool (initial + results), transpose tool (initial + results), settings — all rendering correctly with no major issues.
    560→   560→- curl verified both APIs end-to-end:
    561→   561→  - validate: 6-row dirty file → score 57/100, 1 error + 3 warnings + 4 infos (math correct)
@@ -569,6 +569,6 @@
    569→   569→- FileDropzone enhanced with clear "Browse Files" button affordance (used by all tools).
    570→   570→- Footer polish with dot separators and responsive hiding.
    571→   571→- All new tools wired into: sidebar, dashboard, command palette, keyboard shortcuts (g+v, g+r), shortcuts help dialog, settings File History labels, about page.
-   572→   572→- Version bumped to v2.3.0 consistently across about page and footer.
+   572→   572→- Version bumped to v2.3.2 consistently across about page and footer.
    573→   573→- Lint passes, dev server healthy, all features verified end-to-end via curl + agent-browser + VLM.
    574→   574→
