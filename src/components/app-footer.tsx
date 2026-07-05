@@ -34,7 +34,7 @@ export function AppFooter({ onOpenShortcuts }: AppFooterProps) {
               Excel Automation Suite
             </span>
             <span className="opacity-50">·</span>
-            <span>v2.3.0</span>
+            <span>v2.3.1</span>
             <span className="opacity-50">·</span>
             <span>© {year}</span>
           </div>
