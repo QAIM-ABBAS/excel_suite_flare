@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect, useRef } from "react"
 import { FileDropzone } from "@/components/file-dropzone"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -14,25 +14,22 @@ import { motion, AnimatePresence } from "framer-motion"
 import { useAppStore } from "@/lib/store"
 import { apiFetch, downloadUrl } from "@/lib/api"
 
-interface ImagesResult {
-  downloadUrl: string
-  filename: string
+interface JobStatus {
+  status: "processing" | "completed" | "failed"
   totalRows: number
   successCount: number
   failCount: number
   results: { row: number; url: string; status: string; error?: string }[]
+  originalName: string
+  error?: string
 }
 
-interface DownloadImagesApiResponse {
-  error?: string
-  downloadUrl?: string
-  filename?: string
-  totalRows?: number
-  successCount?: number
-  failCount?: number
-  totalImages?: number
-  successful?: number
-  results?: { row: number; url: string; status: string; error?: string }[]
+interface ImagesResult {
+  jobId: string
+  totalRows: number
+  successCount: number
+  failCount: number
+  results: { row: number; url: string; status: string; error?: string }[]
 }
 
 export function DownloadImagesTool() {
@@ -44,8 +41,17 @@ export function DownloadImagesTool() {
   const [isProcessing, setIsProcessing] = useState(false)
   const [isLoadingColumns, setIsLoadingColumns] = useState(false)
   const [progress, setProgress] = useState(0)
+  const [progressText, setProgressText] = useState("")
   const [result, setResult] = useState<ImagesResult | null>(null)
   const [viewMode, setViewMode] = useState<"all" | "success" | "failed">("all")
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+    }
+  }, [])
 
   const handleFileSelected = async (files: File[]) => {
     const selected = files[0]
@@ -81,6 +87,71 @@ export function DownloadImagesTool() {
     )
   }
 
+  const pollJobStatus = (jobId: string) => {
+    if (pollRef.current) clearInterval(pollRef.current)
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const response = await apiFetch(`/api/tools/download-images/${jobId}`)
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}))
+          throw new Error(errData.error || `Status ${response.status}`)
+        }
+
+        const meta = (await response.json()) as JobStatus
+        const processed = meta.results.length
+        const total = meta.totalRows || processed
+
+        if (total > 0) {
+          const pct = Math.min(Math.round((processed / total) * 90) + 5, 95)
+          setProgress(pct)
+          setProgressText(`${processed}/${total} images (${meta.successCount} ok, ${meta.failCount} failed)`)
+        }
+
+        if (meta.status === "completed" || meta.status === "failed") {
+          if (pollRef.current) clearInterval(pollRef.current)
+          pollRef.current = null
+
+          if (meta.status === "failed") {
+            throw new Error(meta.error || "Processing failed")
+          }
+
+          setProgress(100)
+          setProgressText("")
+          setIsProcessing(false)
+          decrementActiveTasks()
+
+          setResult({
+            jobId,
+            totalRows: meta.totalRows,
+            successCount: meta.successCount,
+            failCount: meta.failCount,
+            results: meta.results,
+          })
+
+          toast.success(`Processed ${meta.successCount} images successfully!`)
+          if (meta.failCount > 0) {
+            toast.warning(`${meta.failCount} images failed to download`)
+          }
+          pushNotification({
+            title: "Image batch complete",
+            description: `${meta.successCount} succeeded, ${meta.failCount} failed of ${meta.totalRows} total`,
+            type: meta.failCount > 0 ? "warning" : "success",
+          })
+        }
+      } catch (error) {
+        if (pollRef.current) clearInterval(pollRef.current)
+        pollRef.current = null
+        const msg = error instanceof Error ? error.message : "Failed to check job status"
+        toast.error(msg)
+        pushNotification({ title: "Image batch failed", description: msg, type: "error" })
+        setIsProcessing(false)
+        decrementActiveTasks()
+        setTimeout(() => setProgress(0), 1000)
+      }
+    }, 3000)
+  }
+
   const handleProcess = async () => {
     if (!file || !selectedColumn) {
       toast.error("Please select a file and URL column")
@@ -88,7 +159,9 @@ export function DownloadImagesTool() {
     }
 
     setIsProcessing(true)
-    setProgress(10)
+    setProgress(5)
+    setProgressText("Starting job...")
+    setResult(null)
     incrementActiveTasks()
 
     try {
@@ -97,53 +170,28 @@ export function DownloadImagesTool() {
       formData.append("urlColumn", selectedColumn)
       formData.append("selectedColumns", JSON.stringify(selectedColumns))
 
-      // Simulate progress during download
-      const progressInterval = setInterval(() => {
-        setProgress(prev => Math.min(prev + 3, 85))
-      }, 1000)
-
       const response = await apiFetch("/api/tools/download-images", {
         method: "POST",
         body: formData,
       })
 
-      clearInterval(progressInterval)
-      setProgress(90)
+      const data = await response.json()
 
-      const data = (await response.json()) as DownloadImagesApiResponse
-
-      if (!response.ok || data.error) throw new Error(data.error || "Failed to process images")
-
-      const normalizedResults = Array.isArray(data.results) ? data.results : []
-      const totalRows = data.totalRows ?? data.totalImages ?? normalizedResults.length
-      const successCount = data.successCount ?? data.successful ?? normalizedResults.filter((r) => r.status === "success").length
-      const failCount = data.failCount ?? Math.max(totalRows - successCount, 0)
-
-      const normalizedResult: ImagesResult = {
-        downloadUrl: data.downloadUrl || "",
-        filename: data.filename || "",
-        totalRows,
-        successCount,
-        failCount,
-        results: normalizedResults,
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "Failed to start image processing")
       }
 
-      setProgress(100)
-      setResult(normalizedResult)
-      toast.success(`Processed ${normalizedResult.successCount} images successfully!`)
-      if (normalizedResult.failCount > 0) {
-        toast.warning(`${normalizedResult.failCount} images failed to download`)
+      if (!data.jobId) {
+        throw new Error("No job ID returned from server")
       }
-      pushNotification({
-        title: "Image batch complete",
-        description: `${normalizedResult.successCount} succeeded, ${normalizedResult.failCount} failed of ${normalizedResult.totalRows} total`,
-        type: normalizedResult.failCount > 0 ? "warning" : "success",
-      })
+
+      setProgress(10)
+      setProgressText("Job started, processing images...")
+      pollJobStatus(data.jobId)
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to process images"
       toast.error(msg)
       pushNotification({ title: "Image batch failed", description: msg, type: "error" })
-    } finally {
       setIsProcessing(false)
       decrementActiveTasks()
       setTimeout(() => setProgress(0), 1000)
@@ -151,11 +199,17 @@ export function DownloadImagesTool() {
   }
 
   const resetTool = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
     setFile(null)
     setColumns([])
     setSelectedColumn("")
     setSelectedColumns([])
     setResult(null)
+    setProgress(0)
+    setProgressText("")
   }
 
   const resultRows = Array.isArray(result?.results) ? result.results : []
@@ -261,7 +315,9 @@ export function DownloadImagesTool() {
           {isProcessing && (
             <div className="space-y-2">
               <Progress value={progress} className="h-2" />
-              <p className="text-xs text-muted-foreground text-center">Downloading images and processing...</p>
+              <p className="text-xs text-muted-foreground text-center">
+                {progressText || "Downloading images and processing..."}
+              </p>
             </div>
           )}
 
@@ -398,9 +454,9 @@ export function DownloadImagesTool() {
                 )}
 
                 <Button asChild className="w-full">
-                  <a href={downloadUrl(result.downloadUrl)} download>
+                  <a href={downloadUrl(`/api/tools/download-images/${result.jobId}/html`)} download>
                     <Download className="mr-2 h-4 w-4" />
-                    Download Excel with Images
+                    Download HTML with Images
                   </a>
                 </Button>
               </CardContent>

@@ -20,6 +20,9 @@ node_modules
 # production
 /build
 
+# wrangler local dev state (D1, KV blobs, etc.)
+**/.wrangler/state/
+
 # misc
 .DS_Store
 *.pem
@@ -47,6 +50,7 @@ local-*
 dev.log
 dev.out.log
 test
+test-download.mjs
 prompt
 
 server.log

@@ -39,6 +39,33 @@ function generateFilename(baseName: string, extension: string): string {
   return `${sanitizeFilename(baseName)}_${uid}.${extension}`;
 }
 
+// ─── Job-based download-images types and helpers ─────────────────────────────
+
+interface JobMeta {
+  status: 'processing' | 'completed' | 'failed';
+  totalRows: number;
+  successCount: number;
+  failCount: number;
+  results: { row: number; url: string; status: string; error?: string; rowData?: Record<string, unknown> }[];
+  originalName: string;
+  selectedColumns: string[];
+  allColumns: string[];
+  error?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+const JOB_TTL = 3600; // 1 hour
+const CHUNK_SIZE = 50;
+
+async function updateJobMeta(kv: KVNamespace, jobId: string, meta: JobMeta): Promise<void> {
+  await kv.put(`dl:${jobId}:meta`, JSON.stringify(meta), { expirationTtl: JOB_TTL });
+}
+
+async function getJobMeta(kv: KVNamespace, jobId: string): Promise<JobMeta | null> {
+  return kv.get<JobMeta>(`dl:${jobId}:meta`, { type: 'json' });
+}
+
 // POST handler for all tools
 toolsRouter.post('/:tool', async (c) => {
   const toolName = c.req.param('tool');
@@ -87,6 +114,42 @@ toolsRouter.post('/:tool', async (c) => {
       return c.json({ error: 'Unsupported content type' }, 400);
     }
 
+    // Special handling for download-images: async job-based flow
+    if (toolName === 'download-images') {
+      const fileId = args.fileId as string | undefined;
+      if (!fileId) return c.json({ error: 'File path is required' }, 400);
+
+      const fileEntry = fileStore.get(fileId);
+      if (!fileEntry) return c.json({ error: 'File not found' }, 404);
+      // Don't delete yet — processImagesJob needs it
+
+      const jobId = `dl_${Date.now()}_${generateId()}`;
+      const urlColumn = args.urlColumn as string;
+      const originalName = (args.originalName as string) || 'images';
+      const selectedColumns = (args.selectedColumns as string[]) || [];
+
+      const initialMeta: JobMeta = {
+        status: 'processing',
+        totalRows: 0,
+        successCount: 0,
+        failCount: 0,
+        results: [],
+        originalName,
+        selectedColumns,
+        allColumns: [],
+        startedAt: new Date().toISOString(),
+      };
+      await updateJobMeta(c.env.KV, jobId, initialMeta);
+
+      // Fire-and-forget: process images in background
+      c.executionCtx.waitUntil(
+        processImagesJob(jobId, fileEntry.buffer, urlColumn, originalName, selectedColumns, c.env.KV, db)
+          .catch((err) => console.error('processImagesJob failed:', err))
+      );
+
+      return c.json({ jobId, status: 'processing' });
+    }
+
     const result = await dispatchTool(toolName, args, db, c.env.KV);
     
     // If result is a Response (file download), return it directly
@@ -121,6 +184,126 @@ toolsRouter.get('/download-file/:fileId', async (c) => {
       'Content-Disposition': `attachment; filename="${stored.name}"`,
     },
   });
+});
+
+// GET handler for download-images job status
+toolsRouter.get('/download-images/:jobId', async (c) => {
+  const jobId = c.req.param('jobId');
+  const meta = await getJobMeta(c.env.KV, jobId);
+  if (!meta) return c.json({ error: 'Job not found or expired' }, 404);
+  return c.json(meta);
+});
+
+async function buildHtml(jobId: string, meta: JobMeta, kv: KVNamespace): Promise<string> {
+  const successResults = meta.results.filter((r) => r.status === 'success');
+  const imageMap = new Map<number, string | null>();
+
+  for (let i = 0; i < successResults.length; i += 50) {
+    const batch = successResults.slice(i, i + 50);
+    const batchResults = await Promise.all(
+      batch.map(async (r) => {
+        const img = await kv.get(`dl:${jobId}:img:${r.row}`);
+        return { row: r.row, img };
+      })
+    );
+    for (const d of batchResults) {
+      imageMap.set(d.row, d.img);
+    }
+  }
+
+  const displayColumns = meta.selectedColumns.length > 0 ? meta.selectedColumns : meta.allColumns;
+  const headerCells = ['<th>Image</th>', ...displayColumns.map((c) => `<th>${escapeHtml(c)}</th>`)].join('');
+
+  const bodyRows: string[] = [];
+  for (const result of meta.results) {
+    const img = imageMap.get(result.row);
+    const imgCell = img
+      ? `<td class="img-cell"><img src="${img}" /></td>`
+      : `<td class="img-cell empty">${result.status === 'success' ? '' : result.error ? 'Error' : '—'}</td>`;
+    const dataCells = displayColumns.map((c) => `<td>${escapeHtml(String(result.rowData?.[c] ?? ''))}</td>`).join('');
+    bodyRows.push(`<tr>${imgCell}${dataCells}</tr>`);
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${escapeHtml(meta.originalName)}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; background: #f5f5f5; padding: 24px; color: #222; }
+    h1 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #333; }
+    .meta { font-size: 12px; color: #888; margin-bottom: 16px; }
+    .table-wrap { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+    table { border-collapse: collapse; width: 100%; min-width: 600px; }
+    thead tr { background: #f0f0f0; }
+    th { padding: 10px 14px; text-align: left; font-weight: 600; border-bottom: 2px solid #ddd; white-space: nowrap; }
+    td { padding: 8px 14px; border-bottom: 1px solid #eee; vertical-align: middle; }
+    td.img-cell { width: 220px; min-width: 220px; text-align: center; padding: 8px; }
+    td.img-cell img { max-width: 200px; max-height: 200px; border-radius: 4px; display: block; margin: 0 auto; }
+    td.img-cell.empty { color: #bbb; font-size: 12px; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(meta.originalName)}</h1>
+  <p class="meta">
+    ${meta.totalRows} rows ·
+    ${meta.successCount} images loaded ·
+    Generated ${new Date().toLocaleString()}
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>${headerCells}</tr></thead>
+      <tbody>${bodyRows.join('\n')}</tbody>
+    </table>
+  </div>
+</body>
+</html>`;
+
+  return html;
+}
+
+// GET handler for download-images HTML output
+toolsRouter.get('/download-images/:jobId/html', async (c) => {
+  try {
+  const jobId = c.req.param('jobId');
+  const meta = await getJobMeta(c.env.KV, jobId);
+  if (!meta) return c.json({ error: 'Job not found or expired' }, 404);
+  if (meta.status !== 'completed') return c.json({ error: 'Job not yet completed', status: meta.status }, 202);
+
+  // Serve pre-generated HTML (built by processImagesJob)
+  const cachedHtml = await c.env.KV.get(`dl:${jobId}:html`);
+  if (cachedHtml) {
+    return new Response(cachedHtml, {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${generateFilename(meta.originalName, 'html')}"`,
+      },
+    });
+  }
+
+  // Fallback: generate on-the-fly
+  const html = await buildHtml(jobId, meta, c.env.KV);
+  try {
+    await c.env.KV.put(`dl:${jobId}:html`, html, { expirationTtl: JOB_TTL });
+  } catch {
+    // Non-fatal
+  }
+
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${generateFilename(meta.originalName, 'html')}"`,
+    },
+  });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('HTML generation error:', msg, err instanceof Error ? err.stack : '');
+    return c.json({ error: 'HTML generation failed', detail: msg }, 500);
+  }
 });
 
 // GET handler for history and errors
@@ -1171,7 +1354,145 @@ async function toolDownloadExcel(args: { url?: string; originalName?: string }, 
   }
 }
 
-// ─── Tool: download-images ───────────────────────────────────────────────────
+// ─── Tool: download-images (job-based async) ────────────────────────────────
+
+async function processImagesJob(
+  jobId: string,
+  fileBuffer: ArrayBuffer,
+  urlColumn: string,
+  originalName: string,
+  selectedColumns: string[],
+  kv: KVNamespace,
+  db: Database
+): Promise<void> {
+  try {
+    const sheets = readBufferToRows(fileBuffer, originalName);
+    if (!sheets.length) {
+      const meta = await getJobMeta(kv, jobId);
+      if (meta) { meta.status = 'failed'; meta.error = 'No sheets found'; await updateJobMeta(kv, jobId, meta); }
+      return;
+    }
+    const sheet = sheets[0];
+
+    if (!sheet.columns.includes(urlColumn)) {
+      const meta = await getJobMeta(kv, jobId);
+      if (meta) { meta.status = 'failed'; meta.error = `Column "${urlColumn}" not found`; await updateJobMeta(kv, jobId, meta); }
+      return;
+    }
+
+    // Determine columns to include in export
+    let otherColumns = sheet.columns.filter((c) => c !== urlColumn);
+    if (selectedColumns.length > 0) {
+      otherColumns = otherColumns.filter((c) => selectedColumns.includes(c));
+    }
+
+    const urls = sheet.rows.map((r) => (r[urlColumn] || '').trim());
+    const totalRows = urls.length;
+
+    const meta = await getJobMeta(kv, jobId);
+    if (meta) {
+      meta.totalRows = totalRows;
+      meta.selectedColumns = otherColumns;
+      meta.allColumns = sheet.columns;
+      await updateJobMeta(kv, jobId, meta);
+    }
+
+    // Process in chunks
+    const allResults: { row: number; url: string; status: string; error?: string; rowData?: Record<string, unknown> }[] = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < urls.length; i += CHUNK_SIZE) {
+      const chunkUrls = urls.slice(i, i + CHUNK_SIZE);
+
+      const chunkResults = await runWithConcurrency(chunkUrls, CONCURRENCY, (url, j) =>
+        downloadOneImage(url, i + j + 1)
+      );
+
+      // Store images and collect results
+      for (const dr of chunkResults) {
+        const rowIdx = dr.row - 1;
+        const rowData = sheet.rows[rowIdx] || {};
+
+        if (!dr.buffer) {
+          allResults.push({ row: dr.row, url: dr.url, status: dr.status, error: dr.error, rowData });
+          failCount++;
+          continue;
+        }
+
+        try {
+          const { mimeType, isSupported } = detectImageFormat(dr.buffer);
+          if (!isSupported) {
+            allResults.push({ row: dr.row, url: dr.url, status: 'failed', error: 'Unrecognized image format', rowData });
+            failCount++;
+            continue;
+          }
+
+          const b64 = Buffer.from(dr.buffer).toString('base64');
+          const dataUri = `data:${mimeType};base64,${b64}`;
+          await kv.put(`dl:${jobId}:img:${dr.row}`, dataUri, { expirationTtl: JOB_TTL });
+
+          allResults.push({ row: dr.row, url: dr.url, status: 'success', rowData });
+          successCount++;
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : 'Image processing failed';
+          allResults.push({ row: dr.row, url: dr.url, status: 'failed', error: errMsg, rowData });
+          failCount++;
+        }
+      }
+
+      // Update progress after each chunk
+      const updatedMeta = await getJobMeta(kv, jobId);
+      if (updatedMeta) {
+        updatedMeta.successCount = successCount;
+        updatedMeta.failCount = failCount;
+        updatedMeta.results = allResults;
+        await updateJobMeta(kv, jobId, updatedMeta);
+      }
+    }
+
+    // Mark completed
+    const finalMeta = await getJobMeta(kv, jobId);
+    if (finalMeta) {
+      finalMeta.status = 'completed';
+      finalMeta.successCount = successCount;
+      finalMeta.failCount = failCount;
+      finalMeta.results = allResults;
+      finalMeta.completedAt = new Date().toISOString();
+      await updateJobMeta(kv, jobId, finalMeta);
+
+      // Pre-generate and cache HTML so the GET endpoint serves from cache
+      try {
+        const html = await buildHtml(jobId, finalMeta, kv);
+        await kv.put(`dl:${jobId}:html`, html, { expirationTtl: JOB_TTL });
+      } catch (e) {
+        console.error('Pre-generate HTML failed (non-fatal, fallback available):', e);
+      }
+    }
+
+    // Log errors to DB
+    if (failCount > 0) {
+      const failedLines = allResults
+        .filter((r) => r.status === 'failed')
+        .map((r) => `Row ${r.row}: ${r.url} — ${r.error || 'unknown'}`)
+        .join('\n');
+      try {
+        await db.logError('download-images', `${failCount} of ${totalRows} images failed`, failedLines);
+      } catch (e) {
+        console.error('logError failed (non-fatal):', e);
+      }
+    }
+  } catch (err) {
+    const meta = await getJobMeta(kv, jobId);
+    if (meta) {
+      meta.status = 'failed';
+      meta.error = err instanceof Error ? err.message : 'Unknown error';
+      await updateJobMeta(kv, jobId, meta);
+    }
+  }
+}
+
+// ─── Tool: download-images (legacy sync — kept for reference) ────────────────
 
 const CONCURRENCY = 6;
 
