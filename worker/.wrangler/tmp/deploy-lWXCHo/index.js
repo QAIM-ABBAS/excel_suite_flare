@@ -39870,7 +39870,7 @@ app.use("*", cors({
   allowHeaders: ["Content-Type"]
 }));
 app.get("/", (c) => {
-  return c.json({ status: "ok", service: "excel-suite-api" });
+  return c.json({ status: "ok", version: "v2.3.2", service: "excel-suite-api" });
 });
 app.route("/api/tools", toolsRouter);
 app.notFound((c) => {
