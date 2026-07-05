@@ -85,7 +85,7 @@ export function AppFooter({ onOpenShortcuts }: AppFooterProps) {
             <span className="hidden md:inline opacity-30">·</span>
             <span className="inline-flex items-center gap-1">
               <Github className="h-3 w-3" />
-              <span className="hidden sm:inline">Open Source</span>
+              <a href="https://github.com/QAIM-ABBAS/excel_suite_flare/" target="_blank" rel="noopener noreferrer" className="hidden sm:inline"> Open Source </a>
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="hidden sm:inline">Made with</span>
